@@ -23,8 +23,8 @@ def get_secret(name: str, default: str = "") -> str:
         return str(st.secrets[name])
     return os.environ.get(name, default)
 
-OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
-ELEVEN_API_KEY = get_secret("ELEVEN_API_KEY", "")
+OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "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")
+ELEVEN_API_KEY = get_secret("ELEVEN_API_KEY", "09b328c29aff663dfb825276bbb9eaef00c9f369a60037718000cc13a670d3e6")
 ELEVEN_VOICE_ID = get_secret("ELEVEN_VOICE_ID", "kGjJqO6wdwRN9iJsoeIC")
 
 # --------------------
