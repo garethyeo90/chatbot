@@ -24,11 +24,9 @@ def get_secret(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "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")
-ELEVEN_API_KEY = get_secret("ELEVEN_API_KEY", "09b328c29aff663dfb825276bbb9eaef00c9f369a60037718000cc13a670d3e6")
+ELEVEN_API_KEY = get_secret("ELEVEN_API_KEY", "sk_99b03018e9115ffafd4ce5643c4b19cb3ddaf07c8069db3f")
 ELEVEN_VOICE_ID = get_secret("ELEVEN_VOICE_ID", "hkfHEbBvdQFNX4uWHqRF")
 
-st.sidebar.write("ELEVEN key loaded:", bool(ELEVEN_API_KEY))
-st.sidebar.write("ELEVEN key last4:", (ELEVEN_API_KEY or "")[-4:])
 
 # --------------------
 # Models / endpoints
