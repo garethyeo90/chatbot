@@ -13,13 +13,10 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="Linlin Chatbot", page_icon="💬", layout="centered")
 
 # --------------------
-# Secrets / env
+# Secrets / env (safe)
 # --------------------
 def get_secret(name: str, default: str = "") -> str:
-    """
-    Safely read Streamlit secrets, then fall back to environment variables.
-    Does NOT crash if secrets.toml is missing.
-    """
+    """Safely read Streamlit secrets then env vars (won't crash if secrets missing)."""
     try:
         if name in st.secrets:
             return str(st.secrets[name])
@@ -35,17 +32,12 @@ ELEVEN_VOICE_ID = get_secret("ELEVEN_VOICE_ID", "")
 # Models / endpoints
 # --------------------
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "deepseek/deepseek-r1-0528:free"
+OPENROUTER_MODEL = "deepseek/deepseek-r1-0528:free"  # change if your account can't access it
 
 ELEVEN_MODEL_ID = "eleven_multilingual_v2"
-ELEVEN_TTS_URL = (
-    f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
-    if ELEVEN_VOICE_ID
-    else ""
-)
 
 # --------------------
-# Persona (no flirt / teen-safe)
+# Persona (teen-safe: no flirt)
 # --------------------
 PERSONA = """
 你叫“Linlin”。你是一位年轻、亲切的中文（普通话）女助理。
@@ -98,7 +90,7 @@ def fetch_and_extract(url: str, max_chars: int = 12000) -> str:
 # --------------------
 def ask_openrouter(user_text: str) -> str:
     if not OPENROUTER_API_KEY:
-        raise RuntimeError("Missing OPENROUTER_API_KEY (set Streamlit Secrets).")
+        raise RuntimeError("Missing OPENROUTER_API_KEY (set Streamlit Cloud Secrets).")
 
     st.session_state.messages.append({"role": "user", "content": user_text})
 
@@ -113,36 +105,56 @@ def ask_openrouter(user_text: str) -> str:
             "messages": st.session_state.messages,
             "temperature": 0.7,
         },
-        timeout=60,
+        timeout=90,
     )
 
-    # Keep errors readable in the UI
     if r.status_code == 401:
-        raise RuntimeError("OpenRouter 401 Unauthorized: check OPENROUTER_API_KEY / account access.")
-    r.raise_for_status()
+        raise RuntimeError("OpenRouter 401: API key rejected (check Secrets).")
+    if r.status_code == 402:
+        raise RuntimeError("OpenRouter 402: insufficient credits/quota.")
+    if r.status_code == 403:
+        raise RuntimeError("OpenRouter 403: model access denied (try another model).")
+    if r.status_code >= 400:
+        raise RuntimeError(f"OpenRouter error {r.status_code}: {r.text[:400]}")
 
-    reply = r.json()["choices"][0]["message"]["content"]
+    data = r.json()
+    reply = data["choices"][0]["message"]["content"]
     st.session_state.messages.append({"role": "assistant", "content": reply})
     return reply
 
+def openrouter_ping():
+    if not OPENROUTER_API_KEY:
+        return 0, "Missing OPENROUTER_API_KEY"
+    r = requests.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENROUTER_MODEL,
+            "messages": [{"role": "user", "content": "Say OK"}],
+            "temperature": 0.0,
+        },
+        timeout=30,
+    )
+    return r.status_code, r.text[:600]
+
 # --------------------
-# ElevenLabs auth check (optional, handy for debugging)
+# ElevenLabs auth + TTS
 # --------------------
 def eleven_auth_check():
     if not ELEVEN_API_KEY:
         return 0, "Missing ELEVEN_API_KEY"
     headers = {"xi-api-key": ELEVEN_API_KEY}
     r = requests.get("https://api.elevenlabs.io/v1/user", headers=headers, timeout=30)
-    return r.status_code, r.text
+    return r.status_code, r.text[:800]
 
-# --------------------
-# ElevenLabs TTS
-# --------------------
 def speak_elevenlabs_bytes(text: str) -> bytes:
     if not ELEVEN_API_KEY:
-        raise RuntimeError("Missing ELEVEN_API_KEY (set Streamlit Secrets).")
+        raise RuntimeError("Missing ELEVEN_API_KEY (set Streamlit Cloud Secrets).")
     if not ELEVEN_VOICE_ID:
-        raise RuntimeError("Missing ELEVEN_VOICE_ID (set Streamlit Secrets).")
+        raise RuntimeError("Missing ELEVEN_VOICE_ID (set Streamlit Cloud Secrets).")
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
     headers = {
@@ -157,10 +169,10 @@ def speak_elevenlabs_bytes(text: str) -> bytes:
     }
 
     r = requests.post(url, headers=headers, json=payload, timeout=60)
-
     if r.status_code == 401:
-        raise RuntimeError("ElevenLabs 401 Unauthorized: check ELEVEN_API_KEY / account API access.")
-    r.raise_for_status()
+        raise RuntimeError("ElevenLabs 401: API key rejected / API access disabled.")
+    if r.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs error {r.status_code}: {r.text[:400]}")
     return r.content
 
 # --------------------
@@ -169,7 +181,7 @@ def speak_elevenlabs_bytes(text: str) -> bytes:
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "system", "content": PERSONA}]
 if "chat" not in st.session_state:
-    st.session_state.chat = []  # UI history: [{"role":"user/assistant","content":...}]
+    st.session_state.chat = []
 if "last_audio" not in st.session_state:
     st.session_state.last_audio = None
 if "status" not in st.session_state:
@@ -191,31 +203,34 @@ with st.sidebar:
         st.session_state.status = ""
         st.rerun()
 
+    # Test voice: ALWAYS render audio immediately
     if st.button("🔊 测试语音", use_container_width=True):
         try:
-            st.session_state.status = "正在合成语音…"
             audio = speak_elevenlabs_bytes("你好～我在这儿，随时可以陪你练中文。")
             st.session_state.last_audio = audio
-            st.session_state.status = ""
+            st.success("TTS OK (click play if it doesn’t autoplay)")
+            st.audio(audio, format="audio/mpeg")
         except Exception as e:
-            st.session_state.status = ""
             st.error(f"TTS Error: {e}")
 
-    # Optional: auth debug (safe: doesn't print full keys)
     with st.expander("Debug (optional)"):
         st.write("OpenRouter key loaded:", bool(OPENROUTER_API_KEY))
         st.write("ElevenLabs key loaded:", bool(ELEVEN_API_KEY))
+        if st.button("Test OpenRouter"):
+            code, body = openrouter_ping()
+            st.write("Status:", code)
+            st.code(body)
         if st.button("Test ElevenLabs Auth"):
             code, body = eleven_auth_check()
             st.write("Status:", code)
-            st.code(body[:800] if body else "")
+            st.code(body)
 
 # Render chat history
 for m in st.session_state.chat:
     with st.chat_message("user" if m["role"] == "user" else "assistant"):
         st.markdown(m["content"])
 
-# Status + audio
+# Status + audio (always show if exists)
 if st.session_state.status:
     st.info(st.session_state.status)
 
@@ -232,10 +247,12 @@ def handle_user_message(text: str):
 
     try:
         urls = extract_urls(text)
-        if urls:
-            st.session_state.status = "正在读取链接内容…"
-            content = fetch_and_extract(urls[0])
-            prompt = f"""
+
+        with st.spinner("Linlin is thinking..."):
+            if urls:
+                st.session_state.status = "正在读取链接内容…"
+                content = fetch_and_extract(urls[0])
+                prompt = f"""
 我给你一段网页内容，请基于下面正文回答我。
 用户原话：{text}
 
@@ -245,21 +262,29 @@ def handle_user_message(text: str):
 
 请用中文回答，适合口语朗读。
 """
-            reply = ask_openrouter(prompt)
-        else:
-            reply = ask_openrouter(text)
+                reply = ask_openrouter(prompt)
+            else:
+                reply = ask_openrouter(text)
 
+        # Show assistant text first
         st.session_state.chat.append({"role": "assistant", "content": reply})
 
-        # Try TTS, but don't break chat if it fails
+        # Generate audio (and render immediately)
         st.session_state.status = "正在生成语音…"
         try:
-            st.session_state.last_audio = speak_elevenlabs_bytes(reply)
+            SAFE_TTS_CHARS = 800  # helps free-tier limits
+            tts_text = reply[:SAFE_TTS_CHARS]
+            audio = speak_elevenlabs_bytes(tts_text)
+            st.session_state.last_audio = audio
+            st.session_state.status = ""
+
+            # 👇 render player right away
+            st.audio(audio, format="audio/mpeg")
+
         except Exception as e:
             st.session_state.last_audio = None
-            st.warning(f"TTS failed (text still shown): {e}")
-
-        st.session_state.status = ""
+            st.session_state.status = ""
+            st.error(f"TTS failed: {e}")
 
     except Exception as e:
         st.session_state.status = ""
