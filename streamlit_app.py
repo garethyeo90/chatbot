@@ -157,6 +157,15 @@ def openrouter_ping():
     )
     return r.status_code, r.text[:600]
 
+def clean_for_tts(text: str) -> str:
+    replacements = {
+        ":": "，",
+        "：": "，",
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+    return text
+
 # --------------------
 # Edge TTS (returns mp3 bytes)
 # --------------------
