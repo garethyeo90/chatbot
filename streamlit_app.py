@@ -284,7 +284,7 @@ def handle_user_message(text: str):
         st.session_state.status = "正在生成语音…"
         try:
             SAFE_TTS_CHARS = 800  # helps avoid very long audio / timeouts
-            tts_text = reply[:SAFE_TTS_CHARS]
+            tts_text = clean_for_tts(reply[:SAFE_TTS_CHARS])
             audio = speak_edge_tts_bytes(tts_text)
             st.session_state.last_audio = audio
             st.session_state.status = ""
