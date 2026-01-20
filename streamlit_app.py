@@ -1,16 +1,19 @@
 # streamlit_app.py
-# requirements.txt should include: streamlit, requests, beautifulsoup4, lxml
+# requirements.txt should include:
+# streamlit, requests, beautifulsoup4, lxml, edge-tts
 
 import os
 import re
+import asyncio
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+import edge_tts
 
 # --------------------
 # Page config
 # --------------------
-st.set_page_config(page_title="Linlin Chatbot", page_icon="💬", layout="centered")
+st.set_page_config(page_title="Chinese Chatbot", page_icon="💬", layout="centered")
 
 # --------------------
 # Secrets / env (safe)
@@ -25,16 +28,17 @@ def get_secret(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
-ELEVEN_API_KEY = get_secret("ELEVEN_API_KEY", "")
-ELEVEN_VOICE_ID = get_secret("ELEVEN_VOICE_ID", "")
+
+# Edge TTS settings (optional in Secrets)
+EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")  # realistic Mandarin
+EDGE_RATE = get_secret("EDGE_RATE", "-10%")                   # slightly slower sounds natural
+EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 
 # --------------------
 # Models / endpoints
 # --------------------
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "deepseek/deepseek-r1-0528:free"  # change if your account can't access it
-
-ELEVEN_MODEL_ID = "eleven_multilingual_v2"
 
 # --------------------
 # Persona (teen-safe: no flirt)
@@ -141,39 +145,27 @@ def openrouter_ping():
     return r.status_code, r.text[:600]
 
 # --------------------
-# ElevenLabs auth + TTS
+# Edge TTS (returns mp3 bytes)
 # --------------------
-def eleven_auth_check():
-    if not ELEVEN_API_KEY:
-        return 0, "Missing ELEVEN_API_KEY"
-    headers = {"xi-api-key": ELEVEN_API_KEY}
-    r = requests.get("https://api.elevenlabs.io/v1/user", headers=headers, timeout=30)
-    return r.status_code, r.text[:800]
+def speak_edge_tts_bytes(text: str) -> bytes:
+    """
+    Generate MP3 bytes using Microsoft Edge neural voices via edge-tts.
+    Streamlit-safe: uses asyncio.run with a fresh event loop per call.
+    """
+    async def _gen():
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=EDGE_VOICE,
+            rate=EDGE_RATE,
+            volume=EDGE_VOLUME,
+        )
+        audio_bytes = b""
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_bytes += chunk["data"]
+        return audio_bytes
 
-def speak_elevenlabs_bytes(text: str) -> bytes:
-    if not ELEVEN_API_KEY:
-        raise RuntimeError("Missing ELEVEN_API_KEY (set Streamlit Cloud Secrets).")
-    if not ELEVEN_VOICE_ID:
-        raise RuntimeError("Missing ELEVEN_VOICE_ID (set Streamlit Cloud Secrets).")
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
-    headers = {
-        "xi-api-key": ELEVEN_API_KEY,
-        "accept": "audio/mpeg",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model_id": ELEVEN_MODEL_ID,
-        "text": text,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
-    }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code == 401:
-        raise RuntimeError("ElevenLabs 401: API key rejected / API access disabled.")
-    if r.status_code >= 400:
-        raise RuntimeError(f"ElevenLabs error {r.status_code}: {r.text[:400]}")
-    return r.content
+    return asyncio.run(_gen())
 
 # --------------------
 # Session state init
@@ -203,25 +195,22 @@ with st.sidebar:
         st.session_state.status = ""
         st.rerun()
 
-    # Test voice: ALWAYS render audio immediately
+    # Test voice: render audio immediately
     if st.button("🔊 测试语音", use_container_width=True):
         try:
-            audio = speak_elevenlabs_bytes("你好～我在这儿，随时可以陪你练中文。")
+            audio = speak_edge_tts_bytes("你好～我在这儿，随时可以陪你练中文。")
             st.session_state.last_audio = audio
-            st.success("TTS OK (click play if it doesn’t autoplay)")
+            st.success("TTS OK（如果没自动播放，点一下播放键）")
             st.audio(audio, format="audio/mpeg")
         except Exception as e:
             st.error(f"TTS Error: {e}")
 
     with st.expander("Debug (optional)"):
         st.write("OpenRouter key loaded:", bool(OPENROUTER_API_KEY))
-        st.write("ElevenLabs key loaded:", bool(ELEVEN_API_KEY))
+        st.write("Edge voice:", EDGE_VOICE)
+        st.write("Edge rate:", EDGE_RATE)
         if st.button("Test OpenRouter"):
             code, body = openrouter_ping()
-            st.write("Status:", code)
-            st.code(body)
-        if st.button("Test ElevenLabs Auth"):
-            code, body = eleven_auth_check()
             st.write("Status:", code)
             st.code(body)
 
@@ -272,13 +261,13 @@ def handle_user_message(text: str):
         # Generate audio (and render immediately)
         st.session_state.status = "正在生成语音…"
         try:
-            SAFE_TTS_CHARS = 800  # helps free-tier limits
+            SAFE_TTS_CHARS = 800  # helps avoid very long audio / timeouts
             tts_text = reply[:SAFE_TTS_CHARS]
-            audio = speak_elevenlabs_bytes(tts_text)
+            audio = speak_edge_tts_bytes(tts_text)
             st.session_state.last_audio = audio
             st.session_state.status = ""
 
-            # 👇 render player right away
+            # render player right away
             st.audio(audio, format="audio/mpeg")
 
         except Exception as e:
