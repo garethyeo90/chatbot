@@ -38,7 +38,7 @@ EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 # Models / endpoints
 # --------------------
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "qwen/qwen2.5-7b-instruct:free"  # change if your account can't access it
+OPENROUTER_MODEL = "qwen/qwen-2.5-vl-7b-instruct:free"  # change if your account can't access it
 
 # --------------------
 # Persona (teen-safe: no flirt)
