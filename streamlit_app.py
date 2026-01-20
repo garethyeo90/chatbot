@@ -214,7 +214,7 @@ with st.sidebar:
             audio = speak_edge_tts_bytes("你好～我在这儿，随时可以陪你练中文。")
             st.session_state.last_audio = audio
             st.success("TTS OK（如果没自动播放，点一下播放键）")
-            st.audio(audio, format="audio/mpeg")
+            st.audio(audio, format="audio/mpeg", autoplay=True)
         except Exception as e:
             st.error(f"TTS Error: {e}")
 
@@ -237,7 +237,7 @@ if st.session_state.status:
     st.info(st.session_state.status)
 
 if st.session_state.last_audio:
-    st.audio(st.session_state.last_audio, format="audio/mpeg")
+    st.audio(st.session_state.last_audio, format="audio/mpeg", autoplay=True)
 
 # Chat input
 user_text = st.chat_input("输入消息，或粘贴链接后回车…")
