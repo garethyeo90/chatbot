@@ -1,7 +1,30 @@
 # streamlit_app.py
-# requirements.txt should include:
-# streamlit, requests, beautifulsoup4, lxml, edge-tts
-# streamlit-mic-recorder, vosk, numpy, soundfile, scipy
+# Streamlit Cloud friendly voice chatbot:
+# - Chat: OpenRouter
+# - TTS: edge-tts (MP3 bytes)
+# - STT: Vosk (offline) + streamlit-mic-recorder (WAV)
+#
+# requirements.txt (minimum):
+# streamlit
+# requests
+# beautifulsoup4
+# lxml
+# edge-tts
+# streamlit-mic-recorder
+# vosk
+# numpy
+# soundfile
+# scipy
+#
+# IMPORTANT:
+# 1) Put your Vosk model folder in the repo, e.g.
+#    models/vosk-model-small-en-us-0.15/{am,conf,graph,ivector,...}
+# 2) Streamlit Secrets:
+#    OPENROUTER_API_KEY="..."
+#    (optional) EDGE_VOICE="zh-CN-XiaoxiaoNeural"
+#    (optional) EDGE_RATE="-10%"
+#    (optional) EDGE_VOLUME="+0%"
+#    (optional) VOSK_MODEL_PATH="models/vosk-model-small-en-us-0.15"
 
 import os
 import re
@@ -11,29 +34,23 @@ import asyncio
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-import edge_tts
 
+import edge_tts
 import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 from vosk import Model, KaldiRecognizer
 from streamlit_mic_recorder import mic_recorder
-import wave
-import tempfile
-import io
-
-
 
 # --------------------
 # Page config
 # --------------------
-st.set_page_config(page_title="Chinese Chatbot", page_icon="💬", layout="centered")
+st.set_page_config(page_title="Linlin Chatbot", page_icon="💬", layout="centered")
 
 # --------------------
 # Secrets / env (safe)
 # --------------------
 def get_secret(name: str, default: str = "") -> str:
-    """Safely read Streamlit secrets then env vars (won't crash if secrets missing)."""
     try:
         if name in st.secrets:
             return str(st.secrets[name])
@@ -43,19 +60,17 @@ def get_secret(name: str, default: str = "") -> str:
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
 
-# Edge TTS settings (optional in Secrets)
-EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")  # realistic Mandarin
-EDGE_RATE = get_secret("EDGE_RATE", "-10%")                   # slightly slower sounds natural
+EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
+EDGE_RATE = get_secret("EDGE_RATE", "-10%")
 EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 
-# Vosk model path (must exist in repo for Streamlit Cloud)
 VOSK_MODEL_PATH = get_secret("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
 
 # --------------------
 # Models / endpoints
 # --------------------
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "deepseek/deepseek-v3.2"  # change if needed
+OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "deepseek/deepseek-v3.2")
 
 # --------------------
 # Persona
@@ -83,28 +98,8 @@ PERSONA = """
 - 不使用括号来描述情绪，而是用语言自然表达
 
 你的目标：
-让用户感觉是在和一位
-聪明、会共情、说话好听、让人放松的女生聊天。
+让用户感觉是在和一位聪明、会共情、说话好听、让人放松的女生聊天。
 """
-
-# --------------------
-# Speech to Text
-# --------------------
-
-import wave
-import io
-
-def mic_bytes_to_wav_bytes(mic_bytes: bytes) -> bytes:
-    """
-    Wrap mic bytes into a valid WAV file in-memory.
-    """
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)      # 16-bit PCM
-        wf.setframerate(16000)  # 16kHz
-        wf.writeframes(mic_bytes)
-    return buf.getvalue()
 
 # --------------------
 # URL detection & parsing
@@ -158,7 +153,7 @@ def ask_openrouter(user_text: str) -> str:
             "messages": st.session_state.messages,
             "temperature": 0.7,
         },
-        timeout=90,
+        timeout=(15, 90),
     )
 
     if r.status_code == 401:
@@ -190,25 +185,18 @@ def openrouter_ping():
             "temperature": 0.0,
             "max_tokens": 16,
         },
-        timeout=30,
+        timeout=(10, 25),
     )
     return r.status_code, r.text[:600]
 
 # --------------------
-# Clean TTS text
+# TTS helpers
 # --------------------
 def clean_for_tts(text: str) -> str:
-    replacements = {
-        ":": "，",
-        "：": "，",
-    }
-    for k, v in replacements.items():
-        text = text.replace(k, v)
+    for k, v in {":": "，", "：": "，"}.items():
+        text = (text or "").replace(k, v)
     return text
 
-# --------------------
-# Edge TTS (returns mp3 bytes)
-# --------------------
 def speak_edge_tts_bytes(text: str) -> bytes:
     async def _gen():
         communicate = edge_tts.Communicate(
@@ -222,43 +210,45 @@ def speak_edge_tts_bytes(text: str) -> bytes:
             if chunk["type"] == "audio":
                 audio_bytes += chunk["data"]
         return audio_bytes
-
     return asyncio.run(_gen())
 
 # --------------------
-# Vosk STT (free, offline)
+# Vosk STT
 # --------------------
 @st.cache_resource
 def load_vosk_model():
     if not os.path.isdir(VOSK_MODEL_PATH):
-        raise RuntimeError(
-            f"Vosk model folder not found: {VOSK_MODEL_PATH}\n"
-            f"Make sure you added it to your repo (Streamlit Cloud needs it inside GitHub)."
-        )
+        raise RuntimeError(f"Vosk model folder not found: {VOSK_MODEL_PATH}")
+    # (Optional sanity check)
+    for req in ["am", "conf", "graph"]:
+        if not os.path.exists(os.path.join(VOSK_MODEL_PATH, req)):
+            raise RuntimeError(f"Vosk model incomplete: missing '{req}' in {VOSK_MODEL_PATH}")
     return Model(VOSK_MODEL_PATH)
 
-def audio_bytes_to_pcm16k_mono(audio_bytes: bytes):
-    """
-    Robust conversion for mic_recorder audio (works on mobile Safari).
-    """
-    # Convert to mono, 16kHz, 16-bit
-    audio = audio.set_channels(1)
-    audio = audio.set_frame_rate(16000)
-    audio = audio.set_sample_width(2)  # 16-bit
+def wav_bytes_to_pcm16k_mono(wav_bytes: bytes, target_sr: int = 16000):
+    # Decode WAV bytes
+    data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=True)
+    mono = data.mean(axis=1)
 
-    return audio.raw_data, audio.frame_rate
+    # Resample to 16k
+    if sr != target_sr:
+        mono = resample_poly(mono, target_sr, sr)
+        sr = target_sr
 
+    # Convert float [-1,1] -> int16
+    pcm16 = (np.clip(mono, -1.0, 1.0) * 32767).astype(np.int16)
+    return pcm16.tobytes(), sr
 
 def stt_vosk_from_wav_bytes(wav_bytes: bytes) -> str:
     model = load_vosk_model()
-    pcm_bytes, sr = audio_bytes_to_pcm16k_mono(wav_bytes)
+    pcm_bytes, sr = wav_bytes_to_pcm16k_mono(wav_bytes)
 
     rec = KaldiRecognizer(model, sr)
     rec.SetWords(False)
 
     chunk_size = 4000
     for i in range(0, len(pcm_bytes), chunk_size):
-        rec.AcceptWaveform(pcm_bytes[i:i+chunk_size])
+        rec.AcceptWaveform(pcm_bytes[i:i + chunk_size])
 
     result = json.loads(rec.FinalResult())
     return (result.get("text") or "").strip()
@@ -311,12 +301,12 @@ with st.sidebar:
             st.write("Status:", code)
             st.code(body)
 
-# Render chat history
+# Chat history
 for m in st.session_state.chat:
     with st.chat_message("user" if m["role"] == "user" else "assistant"):
         st.markdown(m["content"])
 
-# Status + audio (always show if exists)
+# Status + audio
 if st.session_state.status:
     st.info(st.session_state.status)
 
@@ -324,7 +314,7 @@ if st.session_state.last_audio:
     st.audio(st.session_state.last_audio, format="audio/mpeg", autoplay=True)
 
 # --------------------
-# Voice input: Press-to-speak -> STT -> chat
+# Voice input (Press to speak) -> STT -> chat
 # --------------------
 st.markdown("### 🎙️ 语音输入（按下录音，说完停止）")
 
@@ -332,7 +322,8 @@ mic = mic_recorder(
     start_prompt="🎙️ 开始录音",
     stop_prompt="⏹️ 停止",
     just_once=True,
-    use_container_width=True
+    use_container_width=True,
+    format="wav",  # ✅ critical for iOS/Safari + soundfile
 )
 
 def handle_user_message(text: str):
@@ -376,11 +367,11 @@ def handle_user_message(text: str):
         st.session_state.status = ""
         st.error(f"Error: {e}")
 
+# If mic recorded something, transcribe and send to chat
 if mic and mic.get("bytes"):
     st.session_state.status = "正在识别语音…"
     try:
-        fixed_wav = mic_bytes_to_wav_bytes(mic["bytes"])
-        spoken_text = stt_vosk_from_wav_bytes(fixed_wav)
+        spoken_text = stt_vosk_from_wav_bytes(mic["bytes"])
         st.session_state.status = ""
         if spoken_text:
             st.info(f"🗣️ 你说：{spoken_text}")
@@ -400,10 +391,9 @@ if user_text:
     handle_user_message(user_text)
     st.rerun()
 
-# First greeting if empty
+# First greeting
 if len(st.session_state.chat) == 0:
     st.session_state.chat.append(
         {"role": "assistant", "content": "你好～可以直接聊天，或者用🎙️说话。我会把你说的内容变成文字再回复你。你想先聊什么呢？"}
     )
     st.rerun()
-
