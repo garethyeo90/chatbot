@@ -19,6 +19,9 @@ from scipy.signal import resample_poly
 from vosk import Model, KaldiRecognizer
 from streamlit_mic_recorder import mic_recorder
 from pydub import AudioSegment
+import wave
+import tempfile
+
 
 
 # --------------------
@@ -83,6 +86,28 @@ PERSONA = """
 让用户感觉是在和一位
 聪明、会共情、说话好听、让人放松的女生聊天。
 """
+
+# --------------------
+# Speech to Text
+# --------------------
+
+def mic_bytes_to_wav_bytes(mic_bytes: bytes) -> bytes:
+    """
+    Wrap raw mic bytes into a proper WAV container (Streamlit Cloud safe).
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        wav_path = f.name
+
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)   # 16-bit
+        wf.setframerate(16000)
+        wf.writeframes(mic_bytes)
+
+    with open(wav_path, "rb") as f:
+        wav_bytes = f.read()
+
+    return wav_bytes
 
 # --------------------
 # URL detection & parsing
@@ -360,7 +385,8 @@ def handle_user_message(text: str):
 if mic and mic.get("bytes"):
     st.session_state.status = "正在识别语音…"
     try:
-        spoken_text = stt_vosk_from_wav_bytes(mic["bytes"])
+        fixed_wav = mic_bytes_to_wav_bytes(mic["bytes"])
+        spoken_text = stt_vosk_from_wav_bytes(fixed_wav)
         st.session_state.status = ""
         if spoken_text:
             st.info(f"🗣️ 你说：{spoken_text}")
