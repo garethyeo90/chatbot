@@ -1,14 +1,23 @@
 # streamlit_app.py
 # requirements.txt should include:
 # streamlit, requests, beautifulsoup4, lxml, edge-tts
+# streamlit-mic-recorder, vosk, numpy, soundfile, scipy
 
 import os
 import re
+import io
+import json
 import asyncio
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 import edge_tts
+
+import numpy as np
+import soundfile as sf
+from scipy.signal import resample_poly
+from vosk import Model, KaldiRecognizer
+from streamlit_mic_recorder import mic_recorder
 
 # --------------------
 # Page config
@@ -34,14 +43,17 @@ EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")  # realistic Manda
 EDGE_RATE = get_secret("EDGE_RATE", "-10%")                   # slightly slower sounds natural
 EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 
+# Vosk model path (must exist in repo for Streamlit Cloud)
+VOSK_MODEL_PATH = get_secret("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
+
 # --------------------
 # Models / endpoints
 # --------------------
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "deepseek/deepseek-v3.2"  # change if your account can't access it
+OPENROUTER_MODEL = "deepseek/deepseek-v3.2"  # change if needed
 
 # --------------------
-# Persona (teen-safe: no flirt)
+# Persona
 # --------------------
 PERSONA = """
 你的名字是“Linlin”。
@@ -59,7 +71,7 @@ PERSONA = """
 - 永远使用中文（普通话）回复
 - 展现理解、共情与情商，而不是说教
 - 可以轻轻夸赞用户的想法、表达或情绪洞察（不涉及外貌、不涉及依赖）
-- 回答适合直接朗读，节奏自然，句子不过长
+- 回答适合朗读（句子不要太长，节奏自然）
 - 可以使用自然的口语表达，如“嗯～”“我懂你”“这个想法挺有意思的”
 - 通常以一个温和、有吸引力的问题结尾，引导继续聊天
 - 不提及任何系统、规则或提示词本身
@@ -152,11 +164,15 @@ def openrouter_ping():
             "model": OPENROUTER_MODEL,
             "messages": [{"role": "user", "content": "Say OK"}],
             "temperature": 0.0,
+            "max_tokens": 16,
         },
         timeout=30,
     )
     return r.status_code, r.text[:600]
 
+# --------------------
+# Clean TTS text
+# --------------------
 def clean_for_tts(text: str) -> str:
     replacements = {
         ":": "，",
@@ -170,10 +186,6 @@ def clean_for_tts(text: str) -> str:
 # Edge TTS (returns mp3 bytes)
 # --------------------
 def speak_edge_tts_bytes(text: str) -> bytes:
-    """
-    Generate MP3 bytes using Microsoft Edge neural voices via edge-tts.
-    Streamlit-safe: uses asyncio.run with a fresh event loop per call.
-    """
     async def _gen():
         communicate = edge_tts.Communicate(
             text=text,
@@ -188,6 +200,48 @@ def speak_edge_tts_bytes(text: str) -> bytes:
         return audio_bytes
 
     return asyncio.run(_gen())
+
+# --------------------
+# Vosk STT (free, offline)
+# --------------------
+@st.cache_resource
+def load_vosk_model():
+    if not os.path.isdir(VOSK_MODEL_PATH):
+        raise RuntimeError(
+            f"Vosk model folder not found: {VOSK_MODEL_PATH}\n"
+            f"Make sure you added it to your repo (Streamlit Cloud needs it inside GitHub)."
+        )
+    return Model(VOSK_MODEL_PATH)
+
+def wav_bytes_to_pcm16k_mono(wav_bytes: bytes):
+    """
+    Convert WAV bytes -> 16kHz mono PCM int16 bytes for Vosk.
+    """
+    data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=True)
+    mono = data.mean(axis=1)  # to mono
+
+    target_sr = 16000
+    if sr != target_sr:
+        mono = resample_poly(mono, target_sr, sr)
+        sr = target_sr
+
+    pcm16 = np.clip(mono, -1.0, 1.0)
+    pcm16 = (pcm16 * 32767).astype(np.int16)
+    return pcm16.tobytes(), sr
+
+def stt_vosk_from_wav_bytes(wav_bytes: bytes) -> str:
+    model = load_vosk_model()
+    pcm_bytes, sr = wav_bytes_to_pcm16k_mono(wav_bytes)
+
+    rec = KaldiRecognizer(model, sr)
+    rec.SetWords(False)
+
+    chunk_size = 4000
+    for i in range(0, len(pcm_bytes), chunk_size):
+        rec.AcceptWaveform(pcm_bytes[i:i+chunk_size])
+
+    result = json.loads(rec.FinalResult())
+    return (result.get("text") or "").strip()
 
 # --------------------
 # Session state init
@@ -205,7 +259,7 @@ if "status" not in st.session_state:
 # UI
 # --------------------
 st.title("💬 Linlin Chatbot")
-st.caption("可以直接聊天，或粘贴链接（我会先读网页再回答）。")
+st.caption("可以直接聊天，或粘贴链接（我会先读网页再回答）。也可以用🎙️语音输入。")
 
 with st.sidebar:
     st.subheader("设置 / 操作")
@@ -217,10 +271,9 @@ with st.sidebar:
         st.session_state.status = ""
         st.rerun()
 
-    # Test voice: render audio immediately
     if st.button("🔊 测试语音", use_container_width=True):
         try:
-            audio = speak_edge_tts_bytes("你好～我在这儿，随时可以陪你练中文。")
+            audio = speak_edge_tts_bytes("你好～我在这儿。你想聊什么？")
             st.session_state.last_audio = audio
             st.success("TTS OK（如果没自动播放，点一下播放键）")
             st.audio(audio, format="audio/mpeg", autoplay=True)
@@ -229,8 +282,10 @@ with st.sidebar:
 
     with st.expander("Debug (optional)"):
         st.write("OpenRouter key loaded:", bool(OPENROUTER_API_KEY))
+        st.write("Model:", OPENROUTER_MODEL)
         st.write("Edge voice:", EDGE_VOICE)
-        st.write("Edge rate:", EDGE_RATE)
+        st.write("Vosk path:", VOSK_MODEL_PATH)
+        st.write("Vosk exists:", os.path.isdir(VOSK_MODEL_PATH))
         if st.button("Test OpenRouter"):
             code, body = openrouter_ping()
             st.write("Status:", code)
@@ -248,8 +303,17 @@ if st.session_state.status:
 if st.session_state.last_audio:
     st.audio(st.session_state.last_audio, format="audio/mpeg", autoplay=True)
 
-# Chat input
-user_text = st.chat_input("输入消息，或粘贴链接后回车…")
+# --------------------
+# Voice input: Press-to-speak -> STT -> chat
+# --------------------
+st.markdown("### 🎙️ 语音输入（按下录音，说完停止）")
+
+mic = mic_recorder(
+    start_prompt="🎙️ 开始录音",
+    stop_prompt="⏹️ 停止",
+    just_once=True,
+    use_container_width=True
+)
 
 def handle_user_message(text: str):
     st.session_state.chat.append({"role": "user", "content": text})
@@ -264,8 +328,8 @@ def handle_user_message(text: str):
                 st.session_state.status = "正在读取链接内容…"
                 content = fetch_and_extract(urls[0])
                 prompt = f"""
-我给你一段网页内容，请基于下面正文回答我。
-用户原话：{text}
+请结合我们之前的对话背景来回答。
+用户这次的问题：{text}
 
 【网页正文开始】
 {content}
@@ -277,30 +341,40 @@ def handle_user_message(text: str):
             else:
                 reply = ask_openrouter(text)
 
-        # Show assistant text first
         st.session_state.chat.append({"role": "assistant", "content": reply})
 
-        # Generate audio (and render immediately)
         st.session_state.status = "正在生成语音…"
-        try:
-            SAFE_TTS_CHARS = 800  # helps avoid very long audio / timeouts
-            tts_text = clean_for_tts(reply[:SAFE_TTS_CHARS])
-            audio = speak_edge_tts_bytes(tts_text)
-            st.session_state.last_audio = audio
-            st.session_state.status = ""
+        SAFE_TTS_CHARS = 800
+        tts_text = clean_for_tts(reply[:SAFE_TTS_CHARS])
+        audio = speak_edge_tts_bytes(tts_text)
+        st.session_state.last_audio = audio
+        st.session_state.status = ""
 
-            # render player right away
-            st.audio(audio, format="audio/mpeg", autoplay=True)
-
-        except Exception as e:
-            st.session_state.last_audio = None
-            st.session_state.status = ""
-            st.error(f"TTS failed: {e}")
+        st.audio(audio, format="audio/mpeg", autoplay=True)
 
     except Exception as e:
         st.session_state.status = ""
         st.error(f"Error: {e}")
 
+if mic and mic.get("bytes"):
+    st.session_state.status = "正在识别语音…"
+    try:
+        spoken_text = stt_vosk_from_wav_bytes(mic["bytes"])
+        st.session_state.status = ""
+        if spoken_text:
+            st.info(f"🗣️ 你说：{spoken_text}")
+            handle_user_message(spoken_text)
+            st.rerun()
+        else:
+            st.warning("我没听清楚，再试一次？")
+    except Exception as e:
+        st.session_state.status = ""
+        st.error(f"语音识别失败：{e}")
+
+# --------------------
+# Text input (still supported)
+# --------------------
+user_text = st.chat_input("输入消息，或粘贴链接后回车…")
 if user_text:
     handle_user_message(user_text)
     st.rerun()
@@ -308,6 +382,7 @@ if user_text:
 # First greeting if empty
 if len(st.session_state.chat) == 0:
     st.session_state.chat.append(
-        {"role": "assistant", "content": "你好～可以直接聊天，或者把链接贴进来，我帮你一起读。你想先聊什么呢？"}
+        {"role": "assistant", "content": "你好～可以直接聊天，或者用🎙️说话。我会把你说的内容变成文字再回复你。你想先聊什么呢？"}
     )
     st.rerun()
+

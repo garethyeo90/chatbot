@@ -3,3 +3,8 @@ requests
 beautifulsoup4
 lxml
 edge-tts
+streamlit-mic-recorder
+vosk
+numpy
+soundfile
+scipy
