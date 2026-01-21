@@ -8,3 +8,4 @@ vosk
 numpy
 soundfile
 scipy
+pydub

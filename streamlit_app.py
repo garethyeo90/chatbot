@@ -18,6 +18,8 @@ import soundfile as sf
 from scipy.signal import resample_poly
 from vosk import Model, KaldiRecognizer
 from streamlit_mic_recorder import mic_recorder
+from pydub import AudioSegment
+
 
 # --------------------
 # Page config
@@ -213,25 +215,24 @@ def load_vosk_model():
         )
     return Model(VOSK_MODEL_PATH)
 
-def wav_bytes_to_pcm16k_mono(wav_bytes: bytes):
+def audio_bytes_to_pcm16k_mono(audio_bytes: bytes):
     """
-    Convert WAV bytes -> 16kHz mono PCM int16 bytes for Vosk.
+    Robust conversion for mic_recorder audio (works on mobile Safari).
     """
-    data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=True)
-    mono = data.mean(axis=1)  # to mono
+    # Let pydub auto-detect format
+    audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
 
-    target_sr = 16000
-    if sr != target_sr:
-        mono = resample_poly(mono, target_sr, sr)
-        sr = target_sr
+    # Convert to mono, 16kHz, 16-bit
+    audio = audio.set_channels(1)
+    audio = audio.set_frame_rate(16000)
+    audio = audio.set_sample_width(2)  # 16-bit
 
-    pcm16 = np.clip(mono, -1.0, 1.0)
-    pcm16 = (pcm16 * 32767).astype(np.int16)
-    return pcm16.tobytes(), sr
+    return audio.raw_data, audio.frame_rate
+
 
 def stt_vosk_from_wav_bytes(wav_bytes: bytes) -> str:
     model = load_vosk_model()
-    pcm_bytes, sr = wav_bytes_to_pcm16k_mono(wav_bytes)
+    pcm_bytes, sr = audio_bytes_to_pcm16k_mono(wav_bytes)
 
     rec = KaldiRecognizer(model, sr)
     rec.SetWords(False)
