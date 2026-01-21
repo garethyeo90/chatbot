@@ -20,6 +20,7 @@ from vosk import Model, KaldiRecognizer
 from streamlit_mic_recorder import mic_recorder
 import wave
 import tempfile
+import io
 
 
 
@@ -90,23 +91,20 @@ PERSONA = """
 # Speech to Text
 # --------------------
 
+import wave
+import io
+
 def mic_bytes_to_wav_bytes(mic_bytes: bytes) -> bytes:
     """
-    Wrap raw mic bytes into a proper WAV container (Streamlit Cloud safe).
+    Wrap mic bytes into a valid WAV file in-memory.
     """
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav_path = f.name
-
-    with wave.open(wav_path, "wb") as wf:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)   # 16-bit
-        wf.setframerate(16000)
+        wf.setsampwidth(2)      # 16-bit PCM
+        wf.setframerate(16000)  # 16kHz
         wf.writeframes(mic_bytes)
-
-    with open(wav_path, "rb") as f:
-        wav_bytes = f.read()
-
-    return wav_bytes
+    return buf.getvalue()
 
 # --------------------
 # URL detection & parsing
