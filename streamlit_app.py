@@ -18,7 +18,6 @@ import soundfile as sf
 from scipy.signal import resample_poly
 from vosk import Model, KaldiRecognizer
 from streamlit_mic_recorder import mic_recorder
-from pydub import AudioSegment
 import wave
 import tempfile
 
@@ -244,9 +243,6 @@ def audio_bytes_to_pcm16k_mono(audio_bytes: bytes):
     """
     Robust conversion for mic_recorder audio (works on mobile Safari).
     """
-    # Let pydub auto-detect format
-    audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
-
     # Convert to mono, 16kHz, 16-bit
     audio = audio.set_channels(1)
     audio = audio.set_frame_rate(16000)
