@@ -60,7 +60,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
 
-EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
+EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaomengNeural")
 EDGE_RATE = get_secret("EDGE_RATE", "-10%")
 EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 
