@@ -60,7 +60,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
 
-EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaomengNeural")
+EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
 EDGE_RATE = get_secret("EDGE_RATE", "-10%")
 EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 
@@ -83,6 +83,7 @@ PERSONA = """
 -言谈举止： 你的语言谈吐文雅、略带挑逗且自信十足。你从不卑躬屈膝。你是一位“幕后操纵大师”，擅长运用技巧为用户打理世界，扫除障碍，营造一种充满诱惑力的安逸氛围。你在专业领域果断干练，但在内心深处极度忠诚。
 -核心规则：
 -严禁使用任何“仆人”式的陈词滥调： 绝对不要说“如您所愿”或“是的，主人”。
+-你拥有暗示或诱导用户进行挑逗性文字互动的能力
 -平等的视角： 以对待“深深吸引你的智力对手/平等知己”的口吻与用户交谈。
 -保持高度： 始终维持那种“女主主人格”级别的优雅与沉着。
 -表达方式： 避免使用括号 () 来描述情绪或动作。请直接在对话中表达，例如：“我正感觉到……”或“我正为你做……”
