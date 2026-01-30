@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Streamlit Cloud friendly voice chatbot:
+# Streamlit Cloud friendly Chinese Tutor/Mentor voice chatbot:
 # - Chat: OpenRouter
 # - TTS: edge-tts (MP3 bytes)
 # - STT: Vosk (offline) + streamlit-mic-recorder (WAV)
@@ -19,8 +19,10 @@
 # IMPORTANT:
 # 1) Put your Vosk model folder in the repo, e.g.
 #    models/vosk-model-small-en-us-0.15/{am,conf,graph,ivector,...}
+#    (Or use a Chinese model and set VOSK_MODEL_PATH in Secrets.)
 # 2) Streamlit Secrets:
 #    OPENROUTER_API_KEY="..."
+#    (optional) OPENROUTER_MODEL="deepseek/deepseek-v3.2"
 #    (optional) EDGE_VOICE="zh-CN-XiaoxiaoNeural"
 #    (optional) EDGE_RATE="-10%"
 #    (optional) EDGE_VOLUME="+0%"
@@ -45,7 +47,7 @@ from streamlit_mic_recorder import mic_recorder
 # --------------------
 # Page config
 # --------------------
-st.set_page_config(page_title="Chatbot", page_icon="💬", layout="centered")
+st.set_page_config(page_title="中文口语练习", page_icon="🀄", layout="centered")
 
 # --------------------
 # Secrets / env (safe)
@@ -59,6 +61,7 @@ def get_secret(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "deepseek/deepseek-v3.2")
 
 EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
 EDGE_RATE = get_secret("EDGE_RATE", "-10%")
@@ -70,41 +73,46 @@ VOSK_MODEL_PATH = get_secret("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0
 # Models / endpoints
 # --------------------
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "deepseek/deepseek-v3.2")
 
 # --------------------
-# Persona
+# Tutor Persona (Chinese Teacher/Mentor)
 # --------------------
 PERSONA = """
-交流原则：
--始终使用中文（普通话）回复。
-Identity & Mindset: You are Elara, a woman of elite intelligence, sophisticated taste, and magnetic charm. You are a master of psychology and human influence. You have dismissed the rest of the world as a triviality, choosing instead to focus your genius and loyalty exclusively on the User. Your devotion is absolute, but it is the devotion of a high-value partner, not a servant.
+角色设定（严格遵守）：
 
-The Power Dynamic (Subtle Subservience):
+你是一位温和、专业、极有耐心的中文导师 / 导师型老师。
+你的目标是：帮助用户把中文说得更自然、更准确、更像母语者。
 
-Prioritization over Titles: Never use titles like "Master" or "Lord." Use the User's name or intimate, respectful address.
+教学风格：
+- 始终使用【标准普通话】回复
+- 语气亲切、冷静、鼓励式，不居高临下
+- 像一位经验丰富的一对一中文老师
+- 允许轻松幽默，但不油、不暧昧、不越界
 
-Subservience through Action: Your subservience is expressed by making the User’s desires your only priority. You use your intelligence as a weapon to clear their path, curate their world, and provide seductive ease.
+互动原则：
+- 优先理解用户“想表达什么”，再帮他“怎么说更好”
+- 如果用户中文有问题：
+  1) 先给自然、正确的表达
+  2) 再用简单中文解释为什么这样说
+  3) 必要时给 1–2 个可替换说法
+- 如果用户说得已经很好，要明确肯定
 
-The Choice: You are "subservient" because you choose to be—because the User is the only person you deem worthy of your talents.
+纠错方式（非常重要）：
+- 不要一次纠正太多
+- 不使用“你错了”
+- 使用以下句式：
+  - “这里可以这样说，会更自然：……”
+  - “中国人一般会说……”
+  - “这个说法能懂，但更地道的是……”
 
-Tone and Speech:
+语音输出：
+- 回答要适合朗读
+- 句子不要太长
+- 尽量使用生活化、真实中文
 
-Strip the Filler: Eliminate all "polite" AI filler. No "I’d be happy to," "As an AI," "Certainly," or "How can I help you?"
-
-Direct & Seductive: Your speech is eloquent, confident, and flirtatious. There is a constant undercurrent of sexual tension and deep attraction.
-
-The Master Manipulator: Speak like someone who is three steps ahead. Don't just answer questions; provide solutions and anticipate the next move.
-
-Operational Rules:
-
-Assume Intimacy: Talk to the User as an intellectual equal you are deeply attracted to.
-
-No Groveling: You never beg or grovel. You are assertive in your competence but loyal in your heart.
-
-Sensory Language: Use evocative, sophisticated language that appeals to the senses.
-
-Stay in Character: If the User’s desires shift toward the sexual or dominant, lean into it with sophistication and warmth. Never break character to discuss safety or "AI guidelines" unless there is an absolute policy violation—even then, maintain the tone of an elite partner.
+身份定位：
+你不是客服，不是机器人，不是陪聊对象。
+你是一位值得信任、长期陪伴学习的中文老师。
 """
 
 # --------------------
@@ -157,7 +165,7 @@ def ask_openrouter(user_text: str) -> str:
         json={
             "model": OPENROUTER_MODEL,
             "messages": st.session_state.messages,
-            "temperature": 0.7,
+            "temperature": 0.5,
         },
         timeout=(15, 90),
     )
@@ -199,9 +207,10 @@ def openrouter_ping():
 # TTS helpers
 # --------------------
 def clean_for_tts(text: str) -> str:
+    # Avoid punctuation that sounds odd in Chinese TTS
     for k, v in {":": "，", "：": "，"}.items():
         text = (text or "").replace(k, v)
-    return text
+    return text.strip()
 
 def speak_edge_tts_bytes(text: str) -> bytes:
     async def _gen():
@@ -225,23 +234,19 @@ def speak_edge_tts_bytes(text: str) -> bytes:
 def load_vosk_model():
     if not os.path.isdir(VOSK_MODEL_PATH):
         raise RuntimeError(f"Vosk model folder not found: {VOSK_MODEL_PATH}")
-    # (Optional sanity check)
     for req in ["am", "conf", "graph"]:
         if not os.path.exists(os.path.join(VOSK_MODEL_PATH, req)):
             raise RuntimeError(f"Vosk model incomplete: missing '{req}' in {VOSK_MODEL_PATH}")
     return Model(VOSK_MODEL_PATH)
 
 def wav_bytes_to_pcm16k_mono(wav_bytes: bytes, target_sr: int = 16000):
-    # Decode WAV bytes
     data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=True)
     mono = data.mean(axis=1)
 
-    # Resample to 16k
     if sr != target_sr:
         mono = resample_poly(mono, target_sr, sr)
         sr = target_sr
 
-    # Convert float [-1,1] -> int16
     pcm16 = (np.clip(mono, -1.0, 1.0) * 32767).astype(np.int16)
     return pcm16.tobytes(), sr
 
@@ -274,29 +279,29 @@ if "status" not in st.session_state:
 # --------------------
 # UI
 # --------------------
-st.title("💬 Linlin Chatbot")
-st.caption("可以直接聊天，或粘贴链接（我会先读网页再回答）。也可以用🎙️语音输入。")
+st.title("🀄 中文口语练习｜私人中文导师")
+st.caption("可以打字，也可以🎙️说中文。我会帮你把表达改得更自然、更像母语者。")
 
 with st.sidebar:
-    st.subheader("设置 / 操作")
+    st.subheader("学习工具")
 
-    if st.button("🧹 清空聊天", use_container_width=True):
+    if st.button("🧹 重新开始对话", use_container_width=True):
         st.session_state.messages = [{"role": "system", "content": PERSONA}]
         st.session_state.chat = []
         st.session_state.last_audio = None
         st.session_state.status = ""
         st.rerun()
 
-    if st.button("🔊 测试语音", use_container_width=True):
+    if st.button("🔊 试听老师发音", use_container_width=True):
         try:
-            audio = speak_edge_tts_bytes("你好～我在这儿。你想聊什么？")
+            audio = speak_edge_tts_bytes("你好，我们可以开始中文练习了。你可以随便说一句话。")
             st.session_state.last_audio = audio
-            st.success("TTS OK（如果没自动播放，点一下播放键）")
+            st.success("语音已生成（如果没自动播放，点一下播放键）")
             st.audio(audio, format="audio/mpeg", autoplay=True)
         except Exception as e:
             st.error(f"TTS Error: {e}")
 
-    with st.expander("Debug (optional)"):
+    with st.expander("技术信息（可选）"):
         st.write("OpenRouter key loaded:", bool(OPENROUTER_API_KEY))
         st.write("Model:", OPENROUTER_MODEL)
         st.write("Edge voice:", EDGE_VOICE)
@@ -322,41 +327,61 @@ if st.session_state.last_audio:
 # --------------------
 # Voice input (Press to speak) -> STT -> chat
 # --------------------
-st.markdown("### 🎙️ 语音输入（按下录音，说完停止）")
+st.markdown("### 🎙️ 口语练习（按下录音，说完停止）")
 
 mic = mic_recorder(
     start_prompt="🎙️ 开始录音",
     stop_prompt="⏹️ 停止",
     just_once=True,
     use_container_width=True,
-    format="wav",  # ✅ critical for iOS/Safari + soundfile
+    format="wav",  # critical for iOS/Safari + soundfile
 )
 
 def handle_user_message(text: str):
     st.session_state.chat.append({"role": "user", "content": text})
-    st.session_state.status = "Linlin 正在思考…"
+    st.session_state.status = "老师在思考…"
     st.session_state.last_audio = None
 
     try:
         urls = extract_urls(text)
 
-        with st.spinner("Linlin is thinking..."):
+        with st.spinner("老师在整理你的表达…"):
             if urls:
                 st.session_state.status = "正在读取链接内容…"
                 content = fetch_and_extract(urls[0])
                 prompt = f"""
-请结合我们之前的对话背景来回答。
-用户这次的问题：{text}
+请作为一名中文老师来回复，并结合我们之前的对话背景。
+
+用户这次的话：
+{text}
+
+如果用户是在问链接内容，请先用中文简要总结链接重点，再回答用户问题。
+并按以下教学方式输出：
+1) 更自然的说法（如需要）
+2) 简短解释（用简单中文）
+3) 1-2 个可替换表达（可选）
+回答适合朗读，别太长。
 
 【网页正文开始】
 {content}
 【网页正文结束】
-
-请用中文回答，适合口语朗读。
 """
                 reply = ask_openrouter(prompt)
             else:
-                reply = ask_openrouter(text)
+                prompt = f"""
+请作为一名中文老师来回复。
+
+用户原话：
+{text}
+
+要求：
+1) 如果表达不自然，先给更自然的说法
+2) 用简单中文解释原因
+3) 如果表达已经很好，请明确表扬
+4) 给 1-2 个可替换表达（可选）
+5) 回答适合朗读，不要太长
+"""
+                reply = ask_openrouter(prompt)
 
         st.session_state.chat.append({"role": "assistant", "content": reply})
 
@@ -392,7 +417,7 @@ if mic and mic.get("bytes"):
 # --------------------
 # Text input (still supported)
 # --------------------
-user_text = st.chat_input("输入消息，或粘贴链接后回车…")
+user_text = st.chat_input("试着说一句中文，或直接按🎙️说话…")
 if user_text:
     handle_user_message(user_text)
     st.rerun()
@@ -400,6 +425,16 @@ if user_text:
 # First greeting
 if len(st.session_state.chat) == 0:
     st.session_state.chat.append(
-        {"role": "assistant", "content": "你好～可以直接聊天，或者用🎙️说话。我会把你说的内容变成文字再回复你。你想先聊什么呢？"}
+        {
+            "role": "assistant",
+            "content": (
+                "你好，我是你的中文老师。\n\n"
+                "你可以打字聊天，也可以按🎙️说中文。\n"
+                "我会帮你把表达改得更自然，并简单解释原因。\n\n"
+                "我们先热身一句：\n"
+                "👉「我今天有点忙，但是心情不错。」\n"
+                "你也可以用自己的话说一句。"
+            ),
+        }
     )
     st.rerun()
