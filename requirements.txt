@@ -8,4 +8,5 @@ vosk
 numpy
 soundfile
 scipy
-fitz
+pymupdf==1.24.9
+Pillow
