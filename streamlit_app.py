@@ -327,9 +327,9 @@ def openrouter_ping():
             "model": OPENROUTER_MODEL,
             "messages": [{"role": "user", "content": "Say OK"}],
             "temperature": 0.0,
-            "max_tokens": 16,
+            "max_tokens": 900,
         },
-        timeout=(10, 25),
+        timeout=(15, 240),
     )
     return r.status_code, r.text[:600]
 
