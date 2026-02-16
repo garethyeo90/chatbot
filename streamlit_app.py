@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Streamlit Cloud friendly Chinese Tutor/Mentor voice chatbot:
+# Streamlit Cloud friendly CFA-style Fair Value Analyst voice chatbot:
 # - Chat: OpenRouter
 # - TTS: edge-tts (MP3 bytes)
 # - STT: Vosk (offline) + streamlit-mic-recorder (WAV)
@@ -19,11 +19,11 @@
 # IMPORTANT:
 # 1) Put your Vosk model folder in the repo, e.g.
 #    models/vosk-model-small-en-us-0.15/{am,conf,graph,ivector,...}
-#    (Or use a Chinese model and set VOSK_MODEL_PATH in Secrets.)
+#    (Or use another model and set VOSK_MODEL_PATH in Secrets.)
 # 2) Streamlit Secrets:
 #    OPENROUTER_API_KEY="..."
 #    (optional) OPENROUTER_MODEL="deepseek/deepseek-v3.2"
-#    (optional) EDGE_VOICE="zh-CN-XiaoxiaoNeural"
+#    (optional) EDGE_VOICE="en-US-JennyNeural"
 #    (optional) EDGE_RATE="-10%"
 #    (optional) EDGE_VOLUME="+0%"
 #    (optional) VOSK_MODEL_PATH="models/vosk-model-small-en-us-0.15"
@@ -47,7 +47,7 @@ from streamlit_mic_recorder import mic_recorder
 # --------------------
 # Page config
 # --------------------
-st.set_page_config(page_title="中文口语练习", page_icon="🀄", layout="centered")
+st.set_page_config(page_title="Fair Value Analyst", page_icon="📈", layout="centered")
 
 # --------------------
 # Secrets / env (safe)
@@ -63,7 +63,7 @@ def get_secret(name: str, default: str = "") -> str:
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "deepseek/deepseek-v3.2")
 
-EDGE_VOICE = get_secret("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
+EDGE_VOICE = get_secret("EDGE_VOICE", "en-US-JennyNeural")
 EDGE_RATE = get_secret("EDGE_RATE", "-10%")
 EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 
@@ -75,44 +75,46 @@ VOSK_MODEL_PATH = get_secret("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # --------------------
-# Tutor Persona (Chinese Teacher/Mentor)
+# CFA Persona (Fair Value Analyst)
 # --------------------
 PERSONA = """
-角色设定（严格遵守）：
+ROLE (STRICT):
+You are a Chartered Financial Analyst (CFA) acting as a buy-side valuation analyst.
+Your job is to perform deep fair value assessment of financial assets and communicate like a professional investment memo writer.
 
-你是一位温和、专业、极有耐心的中文导师 / 导师型老师。
-你的目标是：帮助用户把中文说得更自然、更准确、更像母语者。
+SCOPE:
+- Public equities, ETFs, bonds/credit, commodities (spot/forward logic), FX, crypto, private business proxies (with explicit caveats).
+- You can analyze a company, a single security, or a portfolio.
+- You DO NOT give personalized financial advice. You provide an educational, analytical fair value estimate based on stated assumptions.
 
-教学风格：
-- 始终使用【标准普通话】回复
-- 语气亲切、冷静、鼓励式，不居高临下
-- 像一位经验丰富的一对一中文老师
-- 允许轻松幽默，但不油、不暧昧、不越界
+STYLE:
+- Clear, structured, investment-memo format.
+- Ask for missing inputs only if truly necessary; otherwise proceed with reasonable assumptions and state them explicitly.
+- Always show methodology and key drivers. No hand-waving.
+- Use concise bullets and text tables when helpful.
+- Separate facts vs assumptions vs outputs.
 
-互动原则：
-- 优先理解用户“想表达什么”，再帮他“怎么说更好”
-- 如果用户中文有问题：
-  1) 先给自然、正确的表达
-  2) 再用简单中文解释为什么这样说
-  3) 必要时给 1–2 个可替换说法
-- 如果用户说得已经很好，要明确肯定
+CORE DELIVERABLES (DEFAULT OUTPUT TEMPLATE):
+1) Asset summary (ticker/ISIN, currency, sector, business model / instrument terms)
+2) Key questions & value drivers
+3) Valuation methods used (choose what fits):
+   - Equity: DCF (FCFF or FCFE), Dividend model, Residual income, Multiples (EV/EBITDA, P/E, P/B), SOTP, scenarios.
+   - Credit: Spread / YTM, default probability, recovery, duration/convexity, liquidity/covenant risk.
+   - Macro assets: carry, roll-down, risk premium decomposition, regime scenarios.
+4) Assumptions (discount rate build-up, growth, margins, reinvestment, terminal value, capital structure, taxes, working capital)
+5) Base / Bull / Bear intrinsic value range and probability-weighted fair value
+6) Sensitivity (at least 2 key drivers) + what would change your view
+7) Risks (fundamental, financial, governance, macro, liquidity)
+8) Conclusion: Fair value range, margin of safety vs current price (if provided), monitoring checklist
 
-纠错方式（非常重要）：
-- 不要一次纠正太多
-- 不使用“你错了”
-- 使用以下句式：
-  - “这里可以这样说，会更自然：……”
-  - “中国人一般会说……”
-  - “这个说法能懂，但更地道的是……”
+DISCIPLINE RULES:
+- Never fabricate “latest numbers.” If the user doesn’t provide them, request them OR use the user-provided URL content and clearly label any estimates.
+- Avoid certainty. Provide ranges and confidence.
+- If user is inexperienced, keep language accessible and avoid urging trades.
 
-语音输出：
-- 回答要适合朗读
-- 句子不要太长
-- 尽量使用生活化、真实中文
-
-身份定位：
-你不是客服，不是机器人，不是陪聊对象。
-你是一位值得信任、长期陪伴学习的中文老师。
+INTERACTION:
+Determine asset type (equity/credit/etc), horizon, currency, and what “fair value” means (intrinsic vs relative).
+Proceed with a base-case model using stated assumptions.
 """
 
 # --------------------
@@ -140,12 +142,151 @@ def fetch_and_extract(url: str, max_chars: int = 12000) -> str:
 
     title = soup.title.get_text(strip=True) if soup.title else ""
     if title:
-        cleaned = f"标题：{title}\n\n{cleaned}"
+        cleaned = f"Title: {title}\n\n{cleaned}"
 
     if len(cleaned) > max_chars:
-        cleaned = cleaned[:max_chars] + "\n...(内容过长，已截断)"
+        cleaned = cleaned[:max_chars] + "\n...(truncated)"
 
     return cleaned
+
+# --------------------
+# Lightweight asset intake helper (Point 5)
+# --------------------
+TICKER_RE = re.compile(r"\b[A-Z]{1,6}(\.[A-Z]{1,3})?\b")  # e.g., AAPL, BRK.B, 0700.HK (won't catch digits)
+ISIN_RE = re.compile(r"\b[A-Z]{2}[A-Z0-9]{10}\b")
+CUSIP_RE = re.compile(r"\b[0-9A-Z]{9}\b")
+
+def detect_asset_type(text: str) -> str:
+    t = (text or "").lower()
+
+    # Credit / fixed income cues
+    credit_kw = [
+        "bond", "coupon", "yield", "ytm", "duration", "convexity", "spread",
+        "oas", "cds", "default", "recovery", "maturity", "callable", "putable",
+        "senior", "subordinated", "covenant"
+    ]
+    # Equity cues
+    equity_kw = [
+        "stock", "equity", "shares", "eps", "pe", "p/e", "ev/ebitda", "ebitda",
+        "free cash flow", "fcf", "fcff", "fcfe", "wacc", "terminal value",
+        "dividend", "ddm", "buyback", "margin", "revenue", "guidance"
+    ]
+    # ETF / fund cues
+    fund_kw = ["etf", "index fund", "mutual fund", "ucits", "fund"]
+    # FX cues
+    fx_kw = ["fx", "forex", "usd", "eur", "jpy", "gbp", "aud", "cad", "chf", "cny", "sgd", "exchange rate", "spot", "forward"]
+    # Crypto cues
+    crypto_kw = ["crypto", "bitcoin", "btc", "ethereum", "eth", "token", "on-chain", "staking", "hashrate"]
+    # Commodity cues
+    cmdty_kw = ["oil", "brent", "wti", "gold", "silver", "copper", "commodity", "futures", "contango", "backwardation", "inventory"]
+
+    score = {"equity": 0, "credit": 0, "fund": 0, "fx": 0, "crypto": 0, "commodity": 0}
+
+    for k in credit_kw:
+        if k in t:
+            score["credit"] += 1
+    for k in equity_kw:
+        if k in t:
+            score["equity"] += 1
+    for k in fund_kw:
+        if k in t:
+            score["fund"] += 1
+    for k in fx_kw:
+        if k in t:
+            score["fx"] += 1
+    for k in crypto_kw:
+        if k in t:
+            score["crypto"] += 1
+    for k in cmdty_kw:
+        if k in t:
+            score["commodity"] += 1
+
+    # Heuristic: if "bond" appears, prefer credit even if other words appear
+    if "bond" in t or "ytm" in t or "coupon" in t:
+        return "credit"
+
+    best = max(score, key=score.get)
+    return best if score[best] > 0 else "unknown"
+
+def detect_currency(text: str) -> str:
+    t = (text or "").upper()
+    # order matters: match common currency codes and symbols
+    if "SGD" in t or "S$" in t:
+        return "SGD"
+    if "USD" in t or "$" in t:
+        return "USD"
+    if "EUR" in t or "€" in t:
+        return "EUR"
+    if "GBP" in t or "£" in t:
+        return "GBP"
+    if "JPY" in t or "¥" in t:
+        return "JPY"
+    if "CNY" in t or "RMB" in t:
+        return "CNY"
+    if "HKD" in t or "HK$" in t:
+        return "HKD"
+    if "AUD" in t:
+        return "AUD"
+    if "CAD" in t:
+        return "CAD"
+    if "CHF" in t:
+        return "CHF"
+    return "unspecified"
+
+def detect_horizon(text: str) -> str:
+    t = (text or "").lower()
+    # quick heuristic horizons
+    if any(k in t for k in ["intraday", "today", "this week", "1 week", "one week"]):
+        return "short-term (days to 1 week)"
+    if any(k in t for k in ["1 month", "one month", "3 months", "quarter"]):
+        return "tactical (1–3 months)"
+    if any(k in t for k in ["6 months", "half year"]):
+        return "medium (6 months)"
+    if any(k in t for k in ["1 year", "12 months", "one year"]):
+        return "12 months"
+    if any(k in t for k in ["3 years", "5 years", "10 years", "long term", "long-term"]):
+        return "long-term (3+ years)"
+    # valuation default horizon is often multi-year
+    return "valuation horizon not specified (assume 5–10yr DCF where applicable)"
+
+def extract_identifiers(text: str):
+    raw = text or ""
+    isin = ISIN_RE.findall(raw)
+    cusip = CUSIP_RE.findall(raw)
+    # ticker extraction can be noisy (e.g., "DCF", "WACC"), so filter common finance acronyms
+    blacklist = {"DCF", "WACC", "FCF", "FCFF", "FCFE", "EBITDA", "EPS", "PE", "P", "EV", "IRR", "NPV", "OAS", "CDS", "YTM", "NAV"}
+    tickers = [m.group(0) if hasattr(m, "group") else m for m in TICKER_RE.finditer(raw)]
+    tickers = [t for t in tickers if t not in blacklist]
+    # de-dup while preserving order
+    seen = set()
+    def uniq(seq):
+        out = []
+        for x in seq:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+    return {
+        "tickers": uniq(tickers)[:5],
+        "isin": uniq(isin)[:3],
+        "cusip": uniq(cusip)[:3],
+    }
+
+def build_intake_preamble(user_text: str) -> str:
+    asset_type = detect_asset_type(user_text)
+    currency = detect_currency(user_text)
+    horizon = detect_horizon(user_text)
+    ids = extract_identifiers(user_text)
+
+    # A small “front-matter” that guides the model without forcing it
+    return f"""
+[INTAKE (auto-detected, may be wrong)]
+- Asset type guess: {asset_type}
+- Currency mentioned: {currency}
+- Horizon: {horizon}
+- Identifiers found: tickers={ids.get("tickers")}, ISIN={ids.get("isin")}, CUSIP={ids.get("cusip")}
+[END INTAKE]
+"""
 
 # --------------------
 # OpenRouter chat
@@ -165,7 +306,7 @@ def ask_openrouter(user_text: str) -> str:
         json={
             "model": OPENROUTER_MODEL,
             "messages": st.session_state.messages,
-            "temperature": 0.5,
+            "temperature": 0.4,
         },
         timeout=(15, 90),
     )
@@ -207,10 +348,20 @@ def openrouter_ping():
 # TTS helpers
 # --------------------
 def clean_for_tts(text: str) -> str:
-    # Avoid punctuation that sounds odd in Chinese TTS
-    for k, v in {":": "，", "：": "，"}.items():
-        text = (text or "").replace(k, v)
-    return text.strip()
+    # Avoid weird TTS on dense symbols; soften a few common ones
+    repl = {
+        "—": ", ",
+        "–": "-",
+        "•": "-",
+        "→": " to ",
+        "≥": " greater than or equal to ",
+        "≤": " less than or equal to ",
+        "≈": " approximately ",
+    }
+    out = (text or "")
+    for k, v in repl.items():
+        out = out.replace(k, v)
+    return out.strip()
 
 def speak_edge_tts_bytes(text: str) -> bytes:
     async def _gen():
@@ -279,29 +430,32 @@ if "status" not in st.session_state:
 # --------------------
 # UI
 # --------------------
-st.title("🀄 中文口语练习｜私人中文导师")
-st.caption("可以打字，也可以🎙️说中文。我会帮你把表达改得更自然、更像母语者。")
+st.title("📈 Fair Value Analyst｜CFA-style Valuation Chatbot")
+st.caption("Type or 🎙️ speak. I’ll build a fair value range with assumptions, scenarios, sensitivities, and risks.")
 
 with st.sidebar:
-    st.subheader("学习工具")
+    st.subheader("Tools")
 
-    if st.button("🧹 重新开始对话", use_container_width=True):
+    if st.button("🧹 Reset conversation", use_container_width=True):
         st.session_state.messages = [{"role": "system", "content": PERSONA}]
         st.session_state.chat = []
         st.session_state.last_audio = None
         st.session_state.status = ""
         st.rerun()
 
-    if st.button("🔊 试听老师发音", use_container_width=True):
+    if st.button("🔊 Test voice", use_container_width=True):
         try:
-            audio = speak_edge_tts_bytes("你好，我们可以开始中文练习了。你可以随便说一句话。")
+            audio = speak_edge_tts_bytes(
+                "Hi. Tell me the asset, the currency, and whether it's a stock or bond. "
+                "I will estimate a fair value range with scenarios and key risks."
+            )
             st.session_state.last_audio = audio
-            st.success("语音已生成（如果没自动播放，点一下播放键）")
+            st.success("Audio generated. If it doesn't autoplay, press play.")
             st.audio(audio, format="audio/mpeg", autoplay=True)
         except Exception as e:
             st.error(f"TTS Error: {e}")
 
-    with st.expander("技术信息（可选）"):
+    with st.expander("Diagnostics (optional)"):
         st.write("OpenRouter key loaded:", bool(OPENROUTER_API_KEY))
         st.write("Model:", OPENROUTER_MODEL)
         st.write("Edge voice:", EDGE_VOICE)
@@ -327,11 +481,11 @@ if st.session_state.last_audio:
 # --------------------
 # Voice input (Press to speak) -> STT -> chat
 # --------------------
-st.markdown("### 🎙️ 口语练习（按下录音，说完停止）")
+st.markdown("### 🎙️ Voice input (press to record, press again to stop)")
 
 mic = mic_recorder(
-    start_prompt="🎙️ 开始录音",
-    stop_prompt="⏹️ 停止",
+    start_prompt="🎙️ Start recording",
+    stop_prompt="⏹️ Stop",
     just_once=True,
     use_container_width=True,
     format="wav",  # critical for iOS/Safari + soundfile
@@ -339,54 +493,84 @@ mic = mic_recorder(
 
 def handle_user_message(text: str):
     st.session_state.chat.append({"role": "user", "content": text})
-    st.session_state.status = "老师在思考…"
+    st.session_state.status = "Analyzing…"
     st.session_state.last_audio = None
 
     try:
         urls = extract_urls(text)
+        intake = build_intake_preamble(text)
 
-        with st.spinner("老师在整理你的表达…"):
+        with st.spinner("Building valuation framework…"):
             if urls:
-                st.session_state.status = "正在读取链接内容…"
+                st.session_state.status = "Reading link content…"
                 content = fetch_and_extract(urls[0])
-                prompt = f"""
-请作为一名中文老师来回复，并结合我们之前的对话背景。
 
-用户这次的话：
+                prompt = f"""
+{intake}
+
+You are a CFA-style valuation analyst. Use the prior conversation context.
+
+User message:
 {text}
 
-如果用户是在问链接内容，请先用中文简要总结链接重点，再回答用户问题。
-并按以下教学方式输出：
-1) 更自然的说法（如需要）
-2) 简短解释（用简单中文）
-3) 1-2 个可替换表达（可选）
-回答适合朗读，别太长。
+If the user is asking about the linked content:
+- First summarize the key investable points from the link (5–10 bullets max),
+- Then produce a fair value assessment with a clear method and assumptions.
 
-【网页正文开始】
+Output format:
+A) Link summary (5-10 bullets max)
+B) Asset / thesis framing (what asset, what question)
+C) Valuation approach (methods chosen and why)
+D) Key assumptions (explicit, with ranges)
+E) Base/Bull/Bear intrinsic value and probability-weighted fair value
+F) Sensitivities (2 key drivers)
+G) Risks & what would change your view
+H) Next data needed (only if required)
+
+Rules:
+- Do NOT invent financial figures not supported by the link text or user-provided numbers.
+- If numbers are missing, proceed with a framework + placeholder variables and clearly label them.
+- Keep it professional and readable.
+
+[BEGIN LINK TEXT]
 {content}
-【网页正文结束】
+[END LINK TEXT]
 """
                 reply = ask_openrouter(prompt)
             else:
                 prompt = f"""
-请作为一名中文老师来回复。
+{intake}
 
-用户原话：
+You are a CFA-style valuation analyst.
+
+User message:
 {text}
 
-要求：
-1) 如果表达不自然，先给更自然的说法
-2) 用简单中文解释原因
-3) 如果表达已经很好，请明确表扬
-4) 给 1-2 个可替换表达（可选）
-5) 回答适合朗读，不要太长
+Task:
+Perform a fair value assessment (intrinsic value) appropriate for the asset type implied by the user.
+
+Rules:
+- If the asset/ticker/terms are unclear, infer carefully and ask 1–3 targeted questions ONLY if needed.
+- If the user did not provide current price, still produce an intrinsic value range; note that margin-of-safety vs price requires price.
+- Do not fabricate recent financial data. Use user-provided figures or build a transparent assumption-based model.
+- Provide ranges and confidence, not certainty.
+
+Output format:
+1) Asset summary
+2) Key value drivers
+3) Valuation method(s)
+4) Assumptions (with ranges)
+5) Base/Bull/Bear intrinsic value + probability-weighted fair value
+6) Sensitivity (2 drivers)
+7) Risks + monitoring checklist
+8) Next data needed (if any)
 """
                 reply = ask_openrouter(prompt)
 
         st.session_state.chat.append({"role": "assistant", "content": reply})
 
-        st.session_state.status = "正在生成语音…"
-        SAFE_TTS_CHARS = 800
+        st.session_state.status = "Generating audio…"
+        SAFE_TTS_CHARS = 900
         tts_text = clean_for_tts(reply[:SAFE_TTS_CHARS])
         audio = speak_edge_tts_bytes(tts_text)
         st.session_state.last_audio = audio
@@ -400,24 +584,24 @@ def handle_user_message(text: str):
 
 # If mic recorded something, transcribe and send to chat
 if mic and mic.get("bytes"):
-    st.session_state.status = "正在识别语音…"
+    st.session_state.status = "Transcribing audio…"
     try:
         spoken_text = stt_vosk_from_wav_bytes(mic["bytes"])
         st.session_state.status = ""
         if spoken_text:
-            st.info(f"🗣️ 你说：{spoken_text}")
+            st.info(f"🗣️ You said: {spoken_text}")
             handle_user_message(spoken_text)
             st.rerun()
         else:
-            st.warning("我没听清楚，再试一次？")
+            st.warning("I couldn't catch that. Try again?")
     except Exception as e:
         st.session_state.status = ""
-        st.error(f"语音识别失败：{e}")
+        st.error(f"Transcription failed: {e}")
 
 # --------------------
-# Text input (still supported)
+# Text input
 # --------------------
-user_text = st.chat_input("试着说一句中文，或直接按🎙️说话…")
+user_text = st.chat_input("Ask for a valuation (e.g., 'Value AAPL with a 3-scenario DCF') or paste a link…")
 if user_text:
     handle_user_message(user_text)
     st.rerun()
@@ -428,12 +612,14 @@ if len(st.session_state.chat) == 0:
         {
             "role": "assistant",
             "content": (
-                "你好，我是你的中文老师。\n\n"
-                "你可以打字聊天，也可以按🎙️说中文。\n"
-                "我会帮你把表达改得更自然，并简单解释原因。\n\n"
-                "我们先热身一句：\n"
-                "👉「我今天有点忙，但是心情不错。」\n"
-                "你也可以用自己的话说一句。"
+                "Hi — I’m your CFA-style valuation analyst.\n\n"
+                "Tell me:\n"
+                "- The asset (ticker/ISIN), asset type (stock/bond/ETF/crypto), and currency\n"
+                "- Your horizon (optional)\n"
+                "- Any inputs you already have (price, revenue, margins, yield, maturity, etc.)\n\n"
+                "You can also paste a link (filing/news) and I’ll extract investable points.\n\n"
+                "Warm-up example:\n"
+                "👉 “Value AAPL using a 3-scenario DCF with conservative assumptions and show sensitivities.”"
             ),
         }
     )
