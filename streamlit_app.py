@@ -88,7 +88,7 @@ def get_secret(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "anthropic/claude-opus-4.6")
+OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
 OPENROUTER_VISION_MODEL = get_secret("OPENROUTER_VISION_MODEL", "")
 
 EDGE_VOICE = get_secret("EDGE_VOICE", "en-US-JennyNeural")
