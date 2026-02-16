@@ -71,8 +71,8 @@ EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 VOSK_MODEL_PATH = get_secret("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
 
 # Optional tuning
-OPENROUTER_TIMEOUT_READ = int(get_secret("OPENROUTER_TIMEOUT_READ", "90"))  # seconds
-TTS_TIMEOUT_SECONDS = int(get_secret("TTS_TIMEOUT_SECONDS", "20"))          # seconds
+OPENROUTER_TIMEOUT_READ = int(get_secret("OPENROUTER_TIMEOUT_READ", "300"))  # seconds
+TTS_TIMEOUT_SECONDS = int(get_secret("TTS_TIMEOUT_SECONDS", "300"))          # seconds
 
 # --------------------
 # Models / endpoints
