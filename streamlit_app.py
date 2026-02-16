@@ -1,9 +1,10 @@
 # streamlit_app.py
-# Streamlit Cloud friendly CFA-style Fair Value Analyst voice chatbot:
-# - Chat: OpenRouter (text + optional vision)
-# - URL ingestion: HTML + PDF (text extract) + PDF (image render fallback for slide decks like Workiva)
-# - TTS: edge-tts (MP3 bytes) with HARD TIMEOUT + toggle
-# - STT: Vosk (offline) + streamlit-mic-recorder (WAV)
+# CFA-style Fair Value Analyst voice chatbot (Streamlit):
+# - OpenRouter chat (text + optional vision)
+# - URL ingestion: HTML + PDF text + PDF slide images fallback
+# - Output controls: higher max_tokens, trimmed history, auto-continue for cutoffs
+# - TTS: edge-tts (MP3) with timeout + toggle + longer audio char cap
+# - STT: Vosk + streamlit-mic-recorder
 #
 # requirements.txt (minimum):
 # streamlit
@@ -20,18 +21,22 @@
 # Pillow
 #
 # IMPORTANT:
-# 1) Put your Vosk model folder in the repo, e.g.
-#    models/vosk-model-small-en-us-0.15/{am,conf,graph,ivector,...}
-# 2) Streamlit Secrets:
-#    OPENROUTER_API_KEY="..."
-#    (optional) OPENROUTER_MODEL="deepseek/deepseek-v3.2"
-#    (optional) OPENROUTER_VISION_MODEL="..."  # MUST be a vision-capable model if you want PDF slide images parsed
-#    (optional) EDGE_VOICE="en-US-JennyNeural"
-#    (optional) EDGE_RATE="-10%"
-#    (optional) EDGE_VOLUME="+0%"
-#    (optional) VOSK_MODEL_PATH="models/vosk-model-small-en-us-0.15"
-#    (optional) OPENROUTER_TIMEOUT_READ=240
-#    (optional) TTS_TIMEOUT_SECONDS=20
+# - Do NOT install "fitz" from pip. Use "pymupdf".
+# - Streamlit Secrets:
+#   OPENROUTER_API_KEY="..."
+#   (optional) OPENROUTER_MODEL="deepseek/deepseek-v3.2"
+#   (optional) OPENROUTER_VISION_MODEL="..."   # vision-capable model for slide images
+#   (optional) EDGE_VOICE="en-US-JennyNeural"
+#   (optional) EDGE_RATE="-10%"
+#   (optional) EDGE_VOLUME="+0%"
+#   (optional) VOSK_MODEL_PATH="models/vosk-model-small-en-us-0.15"
+#   (optional) OPENROUTER_TIMEOUT_READ=240
+#   (optional) TTS_TIMEOUT_SECONDS=25
+#   (optional) MAX_TOKENS=2200
+#   (optional) HISTORY_TURNS=14
+#   (optional) CONTINUE_PASSES=2
+#   (optional) EXTRACT_MAX_CHARS=20000
+#   (optional) TTS_MAX_CHARS=1200
 
 import os
 import re
@@ -39,7 +44,7 @@ import io
 import json
 import asyncio
 import base64
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import requests
 import streamlit as st
@@ -52,8 +57,19 @@ from scipy.signal import resample_poly
 from vosk import Model, KaldiRecognizer
 from streamlit_mic_recorder import mic_recorder
 
-import fitz  # PyMuPDF
-
+# PyMuPDF import guard (prevents wrong "fitz" package issue)
+try:
+    import fitz  # PyMuPDF provides module name 'fitz'
+    if not hasattr(fitz, "open"):
+        raise ImportError("fitz imported but missing fitz.open; likely wrong pip package 'fitz'. Use 'pymupdf'.")
+except Exception as e:
+    raise ImportError(
+        "PDF support requires PyMuPDF.\n"
+        "Fix requirements.txt:\n"
+        "  - REMOVE: fitz\n"
+        "  - ADD:    pymupdf\n"
+        f"Details: {e}"
+    )
 
 # --------------------
 # Page config
@@ -73,7 +89,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "anthropic/claude-opus-4.6")
-OPENROUTER_VISION_MODEL = get_secret("OPENROUTER_VISION_MODEL", "")  # optional, must be vision-capable
+OPENROUTER_VISION_MODEL = get_secret("OPENROUTER_VISION_MODEL", "")
 
 EDGE_VOICE = get_secret("EDGE_VOICE", "en-US-JennyNeural")
 EDGE_RATE = get_secret("EDGE_RATE", "-10%")
@@ -82,7 +98,14 @@ EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 VOSK_MODEL_PATH = get_secret("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
 
 OPENROUTER_TIMEOUT_READ = int(get_secret("OPENROUTER_TIMEOUT_READ", "240"))
-TTS_TIMEOUT_SECONDS = int(get_secret("TTS_TIMEOUT_SECONDS", "20"))
+TTS_TIMEOUT_SECONDS = int(get_secret("TTS_TIMEOUT_SECONDS", "25"))
+
+# Output controls (updated limits)
+MAX_TOKENS = int(get_secret("MAX_TOKENS", "2200"))            # higher output limit
+HISTORY_TURNS = int(get_secret("HISTORY_TURNS", "14"))        # keep last N messages (plus system)
+CONTINUE_PASSES = int(get_secret("CONTINUE_PASSES", "2"))     # auto-continue attempts
+EXTRACT_MAX_CHARS = int(get_secret("EXTRACT_MAX_CHARS", "20000"))
+TTS_MAX_CHARS = int(get_secret("TTS_MAX_CHARS", "1200"))
 
 # --------------------
 # Endpoints
@@ -98,45 +121,29 @@ You are a Chartered Financial Analyst (CFA) acting as a buy-side valuation analy
 Your job is to perform deep fair value assessment of financial assets and communicate like a professional investment memo writer.
 
 SCOPE:
-- Public equities, ETFs, bonds/credit, commodities (spot/forward logic), FX, crypto, private business proxies (with explicit caveats).
-- You DO NOT give personalized financial advice. You provide an educational, analytical fair value estimate based on stated assumptions.
+- Public equities, ETFs, bonds/credit, commodities, FX, crypto (with explicit caveats).
+- You DO NOT give personalized financial advice. You provide educational, analytical fair value estimates based on stated assumptions.
 
 STYLE:
-- Clear, structured, investment-memo format.
+- Clear, structured investment-memo format.
 - Ask for missing inputs only if truly necessary; otherwise proceed with reasonable assumptions and state them explicitly.
-- Always show methodology and key drivers.
 - Separate facts vs assumptions vs outputs.
 
-CORE DELIVERABLES (DEFAULT OUTPUT TEMPLATE):
-1) Asset summary (ticker/ISIN, currency, sector, business model / instrument terms)
-2) Key value drivers
-3) Valuation method(s) and why
-4) Assumptions (discount rate build-up, growth, margins, reinvestment, terminal value, capital structure)
-5) Base / Bull / Bear intrinsic value range + probability-weighted fair value
-6) Sensitivity (at least 2 key drivers)
-7) Risks + monitoring checklist
-8) Next data needed (only if required)
-
 DISCIPLINE RULES:
-- Never fabricate “latest numbers.” If the user doesn’t provide them or link text/slides don’t contain them, do NOT state specific historical revenue/EPS figures.
-- If data is missing, proceed with a transparent framework and clearly label illustrative assumptions.
+- Never fabricate “latest numbers.” If the user doesn’t provide them or link/slides don’t contain them, do NOT state specific historical revenue/EPS figures.
+- If data is missing, proceed with transparent placeholders and clearly label illustrative assumptions.
 - Provide ranges and confidence, not certainty.
-
-INTERACTION:
-Determine asset type, horizon, currency, and what “fair value” means (intrinsic vs relative).
-Proceed with a base-case model using stated assumptions.
 """
 
 # --------------------
 # URL detection
 # --------------------
 URL_RE = re.compile(r"(https?://[^\s]+)")
-
 def extract_urls(text: str) -> List[str]:
     return URL_RE.findall(text or "")
 
 # --------------------
-# Asset intake helper (Point 5)
+# Asset intake helper
 # --------------------
 TICKER_RE = re.compile(r"\b[A-Z]{1,6}(\.[A-Z]{1,3})?\b")
 ISIN_RE = re.compile(r"\b[A-Z]{2}[A-Z0-9]{10}\b")
@@ -144,47 +151,19 @@ CUSIP_RE = re.compile(r"\b[0-9A-Z]{9}\b")
 
 def detect_asset_type(text: str) -> str:
     t = (text or "").lower()
-
-    credit_kw = [
-        "bond", "coupon", "yield", "ytm", "duration", "convexity", "spread",
-        "oas", "cds", "default", "recovery", "maturity", "callable", "putable",
-        "senior", "subordinated", "covenant"
-    ]
-    equity_kw = [
-        "stock", "equity", "shares", "eps", "pe", "p/e", "ev/ebitda", "ebitda",
-        "free cash flow", "fcf", "fcff", "fcfe", "wacc", "terminal value",
-        "dividend", "ddm", "buyback", "margin", "revenue", "guidance", "dcf"
-    ]
-    fund_kw = ["etf", "index fund", "mutual fund", "ucits", "fund"]
-    fx_kw = ["fx", "forex", "exchange rate", "spot", "forward", "usd", "eur", "jpy", "gbp", "aud", "cad", "chf", "cny", "sgd"]
-    crypto_kw = ["crypto", "bitcoin", "btc", "ethereum", "eth", "token", "on-chain", "staking", "hashrate"]
-    cmdty_kw = ["oil", "brent", "wti", "gold", "silver", "copper", "commodity", "futures", "contango", "backwardation", "inventory"]
-
-    score = {"equity": 0, "credit": 0, "fund": 0, "fx": 0, "crypto": 0, "commodity": 0}
-    for k in credit_kw:
-        if k in t:
-            score["credit"] += 1
-    for k in equity_kw:
-        if k in t:
-            score["equity"] += 1
-    for k in fund_kw:
-        if k in t:
-            score["fund"] += 1
-    for k in fx_kw:
-        if k in t:
-            score["fx"] += 1
-    for k in crypto_kw:
-        if k in t:
-            score["crypto"] += 1
-    for k in cmdty_kw:
-        if k in t:
-            score["commodity"] += 1
-
-    if "bond" in t or "ytm" in t or "coupon" in t:
+    if any(k in t for k in ["bond", "ytm", "coupon", "duration", "spread", "oas", "cds"]):
         return "credit"
-
-    best = max(score, key=score.get)
-    return best if score[best] > 0 else "unknown"
+    if any(k in t for k in ["etf", "fund", "ucits"]):
+        return "fund"
+    if any(k in t for k in ["fx", "forex", "exchange rate", "spot", "forward"]):
+        return "fx"
+    if any(k in t for k in ["crypto", "bitcoin", "btc", "ethereum", "eth", "token"]):
+        return "crypto"
+    if any(k in t for k in ["oil", "gold", "silver", "commodity", "futures"]):
+        return "commodity"
+    if any(k in t for k in ["stock", "equity", "dcf", "wacc", "ev/ebitda", "eps", "revenue", "margin"]):
+        return "equity"
+    return "unknown"
 
 def detect_currency(text: str) -> str:
     t = (text or "").upper()
@@ -202,37 +181,15 @@ def detect_currency(text: str) -> str:
         return "JPY"
     if "CNY" in t or "RMB" in t:
         return "CNY"
-    if "AUD" in t:
-        return "AUD"
-    if "CAD" in t:
-        return "CAD"
-    if "CHF" in t:
-        return "CHF"
     return "unspecified"
-
-def detect_horizon(text: str) -> str:
-    t = (text or "").lower()
-    if any(k in t for k in ["intraday", "today", "this week", "1 week", "one week"]):
-        return "short-term (days to 1 week)"
-    if any(k in t for k in ["1 month", "one month", "3 months", "quarter"]):
-        return "tactical (1–3 months)"
-    if any(k in t for k in ["6 months", "half year"]):
-        return "medium (6 months)"
-    if any(k in t for k in ["1 year", "12 months", "one year"]):
-        return "12 months"
-    if any(k in t for k in ["3 years", "5 years", "10 years", "long term", "long-term"]):
-        return "long-term (3+ years)"
-    return "not specified (assume multi-year valuation horizon)"
 
 def extract_identifiers(text: str) -> Dict[str, List[str]]:
     raw = text or ""
     isin = ISIN_RE.findall(raw)
     cusip = CUSIP_RE.findall(raw)
-
     blacklist = {"DCF", "WACC", "FCF", "FCFF", "FCFE", "EBITDA", "EPS", "PE", "EV", "IRR", "NPV", "OAS", "CDS", "YTM", "NAV"}
     tickers = [m.group(0) for m in TICKER_RE.finditer(raw)]
     tickers = [t for t in tickers if t not in blacklist]
-
     seen = set()
     def uniq(seq):
         out = []
@@ -241,25 +198,22 @@ def extract_identifiers(text: str) -> Dict[str, List[str]]:
                 seen.add(x)
                 out.append(x)
         return out
-
     return {"tickers": uniq(tickers)[:5], "isin": uniq(isin)[:3], "cusip": uniq(cusip)[:3]}
 
 def build_intake_preamble(user_text: str) -> str:
     asset_type = detect_asset_type(user_text)
     currency = detect_currency(user_text)
-    horizon = detect_horizon(user_text)
     ids = extract_identifiers(user_text)
     return f"""
 [INTAKE (auto-detected, may be wrong)]
 - Asset type guess: {asset_type}
 - Currency mentioned: {currency}
-- Horizon: {horizon}
 - Identifiers found: tickers={ids.get("tickers")}, ISIN={ids.get("isin")}, CUSIP={ids.get("cusip")}
 [END INTAKE]
 """
 
 # --------------------
-# PDF handling: text extraction + image render fallback
+# PDF handling
 # --------------------
 def is_probably_pdf(url: str, content_type: str = "") -> bool:
     u = (url or "").lower()
@@ -273,8 +227,7 @@ def text_quality_ok(text: str, min_chars: int = 800) -> bool:
     if len(s) < min_chars:
         return False
     printable = sum(ch.isprintable() for ch in s)
-    ratio = printable / max(1, len(s))
-    return ratio > 0.92
+    return (printable / max(1, len(s))) > 0.92
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 12) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -298,16 +251,7 @@ def render_pdf_pages_to_png_bytes(pdf_bytes: bytes, max_pages: int = 4, zoom: fl
     doc.close()
     return out
 
-def fetch_and_extract(url: str, max_chars: int = 12000) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "type": "html" | "pdf_text" | "pdf_images",
-        "text": "...",
-        "pdf_images": [png_bytes, ...],
-        "meta": {"content_type": "...", "final_url": "..."}
-      }
-    """
+def fetch_and_extract(url: str, max_chars: int = 20000) -> Dict[str, Any]:
     headers = {"User-Agent": "Mozilla/5.0"}
     r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
     r.raise_for_status()
@@ -322,19 +266,15 @@ def fetch_and_extract(url: str, max_chars: int = 12000) -> Dict[str, Any]:
             if len(text) > max_chars:
                 text = text[:max_chars] + "\n...(truncated)"
             return {"type": "pdf_text", "text": text, "pdf_images": [], "meta": {"content_type": content_type, "final_url": final_url}}
-
         imgs = render_pdf_pages_to_png_bytes(raw, max_pages=4, zoom=2.0)
         return {"type": "pdf_images", "text": "", "pdf_images": imgs, "meta": {"content_type": content_type, "final_url": final_url}}
 
     # HTML path
-    html = r.text
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(r.text, "lxml")
     for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
         tag.decompose()
-
     main = soup.find("article") or soup.find("main") or soup.body
     text = main.get_text("\n") if main else soup.get_text("\n")
-
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     cleaned = "\n".join(lines)
 
@@ -344,12 +284,21 @@ def fetch_and_extract(url: str, max_chars: int = 12000) -> Dict[str, Any]:
 
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars] + "\n...(truncated)"
-
     return {"type": "html", "text": cleaned, "pdf_images": [], "meta": {"content_type": content_type, "final_url": final_url}}
 
 # --------------------
-# OpenRouter: text + vision
+# OpenRouter (trim history + higher max_tokens + auto-continue)
 # --------------------
+def _trimmed_messages() -> List[Dict[str, Any]]:
+    msgs = st.session_state.messages
+    if not msgs:
+        return []
+    system = msgs[0] if msgs[0].get("role") == "system" else None
+    tail = msgs[-HISTORY_TURNS:] if HISTORY_TURNS > 0 else msgs
+    if system and (not tail or tail[0] is not system):
+        return [system] + tail
+    return tail
+
 def _openrouter_post(messages: List[Dict[str, Any]], model_name: str) -> requests.Response:
     return requests.post(
         OPENROUTER_URL,
@@ -361,62 +310,68 @@ def _openrouter_post(messages: List[Dict[str, Any]], model_name: str) -> request
             "model": model_name,
             "messages": messages,
             "temperature": 0.35,
-            "max_tokens": 900,
+            "max_tokens": MAX_TOKENS,  # updated
         },
         timeout=(15, OPENROUTER_TIMEOUT_READ),
     )
 
-def ask_openrouter_text(user_text: str) -> str:
+def _parse_reply(resp: requests.Response) -> str:
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+def _is_likely_cutoff(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    # Heuristics:
+    # - Very close to cap length implies cutoff
+    # - Ends without strong sentence termination
+    if len(t) > 0 and not t.endswith((".", "!", "?", "…", ")", "]")):
+        return True
+    return False
+
+def ask_openrouter_text(prompt: str) -> str:
     if not OPENROUTER_API_KEY:
         raise RuntimeError("Missing OPENROUTER_API_KEY (set Streamlit Cloud Secrets).")
 
-    st.session_state.messages.append({"role": "user", "content": user_text})
+    # append user prompt to conversation
+    st.session_state.messages.append({"role": "user", "content": prompt})
 
-    r = _openrouter_post(st.session_state.messages, OPENROUTER_MODEL)
+    # call with trimmed history
+    r = _openrouter_post(_trimmed_messages(), OPENROUTER_MODEL)
 
     # fallback on common failures
     if r.status_code in (403, 404, 429, 500, 502, 503, 504):
         fallback = "deepseek/deepseek-v3.2"
         if OPENROUTER_MODEL != fallback:
             st.warning(f"Model '{OPENROUTER_MODEL}' failed ({r.status_code}). Falling back to {fallback}.")
-            r = _openrouter_post(st.session_state.messages, fallback)
+            r = _openrouter_post(_trimmed_messages(), fallback)
 
     if r.status_code == 401:
         raise RuntimeError("OpenRouter 401: API key rejected (check Secrets).")
     if r.status_code == 402:
         raise RuntimeError("OpenRouter 402: insufficient credits/quota.")
-    if r.status_code == 403:
-        raise RuntimeError("OpenRouter 403: model access denied (try another model).")
     if r.status_code >= 400:
         raise RuntimeError(f"OpenRouter error {r.status_code}: {r.text[:600]}")
 
-    data = r.json()
-    reply = data["choices"][0]["message"]["content"]
+    reply = _parse_reply(r)
     st.session_state.messages.append({"role": "assistant", "content": reply})
     return reply
 
-def ask_openrouter_vision(user_text: str, png_images: List[bytes]) -> str:
-    """
-    Sends user_text + images to a vision-capable model.
-    Requires OPENROUTER_VISION_MODEL in Secrets (or will fallback to OPENROUTER_MODEL).
-    """
+def ask_openrouter_vision(prompt: str, png_images: List[bytes]) -> str:
     if not OPENROUTER_API_KEY:
         raise RuntimeError("Missing OPENROUTER_API_KEY (set Streamlit Cloud Secrets).")
 
     model_name = OPENROUTER_VISION_MODEL.strip() or OPENROUTER_MODEL
 
-    content_parts: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
+    parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
     for b in png_images:
         b64 = base64.b64encode(b).decode("utf-8")
-        content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
 
-    st.session_state.messages.append({"role": "user", "content": content_parts})
+    st.session_state.messages.append({"role": "user", "content": parts})
 
-    r = _openrouter_post(st.session_state.messages, model_name)
-
-    if r.status_code in (403, 404, 429, 500, 502, 503, 504) and model_name != OPENROUTER_MODEL:
-        st.warning(f"Vision model '{model_name}' failed ({r.status_code}). Trying text model '{OPENROUTER_MODEL}' (may not support images).")
-        r = _openrouter_post(st.session_state.messages, OPENROUTER_MODEL)
+    r = _openrouter_post(_trimmed_messages(), model_name)
 
     if r.status_code >= 400:
         raise RuntimeError(
@@ -424,10 +379,38 @@ def ask_openrouter_vision(user_text: str, png_images: List[bytes]) -> str:
             f"Status {r.status_code}: {r.text[:600]}"
         )
 
-    data = r.json()
-    reply = data["choices"][0]["message"]["content"]
+    reply = _parse_reply(r)
     st.session_state.messages.append({"role": "assistant", "content": reply})
     return reply
+
+def get_full_reply_text(prompt: str) -> str:
+    """Auto-continue for cutoffs."""
+    full = ask_openrouter_text(prompt)
+    passes = 0
+    while passes < CONTINUE_PASSES and _is_likely_cutoff(full):
+        passes += 1
+        cont = ask_openrouter_text(
+            "Continue exactly where you left off. Do NOT repeat earlier text. "
+            "Finish any incomplete sections and include the conclusion."
+        )
+        full = full + "\n\n" + cont
+        if not _is_likely_cutoff(cont):
+            break
+    return full
+
+def get_full_reply_vision(prompt: str, images: List[bytes]) -> str:
+    full = ask_openrouter_vision(prompt, images)
+    passes = 0
+    while passes < CONTINUE_PASSES and _is_likely_cutoff(full):
+        passes += 1
+        cont = ask_openrouter_text(
+            "Continue exactly where you left off. Do NOT repeat earlier text. "
+            "Finish any incomplete sections and include the conclusion."
+        )
+        full = full + "\n\n" + cont
+        if not _is_likely_cutoff(cont):
+            break
+    return full
 
 def openrouter_ping() -> (int, str):
     if not OPENROUTER_API_KEY:
@@ -449,7 +432,7 @@ def openrouter_ping() -> (int, str):
     return r.status_code, r.text[:600]
 
 # --------------------
-# TTS (hard timeout)
+# TTS (longer cap + timeout)
 # --------------------
 def clean_for_tts(text: str) -> str:
     repl = {
@@ -466,13 +449,10 @@ def clean_for_tts(text: str) -> str:
         out = out.replace(k, v)
     return out.strip()
 
-def speak_edge_tts_bytes(text: str, timeout_s: int = 20) -> bytes:
+def speak_edge_tts_bytes(text: str, timeout_s: int = 25) -> bytes:
     async def _gen_audio():
         communicate = edge_tts.Communicate(
-            text=text,
-            voice=EDGE_VOICE,
-            rate=EDGE_RATE,
-            volume=EDGE_VOLUME,
+            text=text, voice=EDGE_VOICE, rate=EDGE_RATE, volume=EDGE_VOLUME
         )
         audio_bytes = b""
         async for chunk in communicate.stream():
@@ -518,14 +498,11 @@ def wav_bytes_to_pcm16k_mono(wav_bytes: bytes, target_sr: int = 16000):
 def stt_vosk_from_wav_bytes(wav_bytes: bytes) -> str:
     model = load_vosk_model()
     pcm_bytes, sr = wav_bytes_to_pcm16k_mono(wav_bytes)
-
     rec = KaldiRecognizer(model, sr)
     rec.SetWords(False)
-
     chunk_size = 4000
     for i in range(0, len(pcm_bytes), chunk_size):
         rec.AcceptWaveform(pcm_bytes[i:i + chunk_size])
-
     result = json.loads(rec.FinalResult())
     return (result.get("text") or "").strip()
 
@@ -563,27 +540,18 @@ with st.sidebar:
         st.session_state.debug_last_step = ""
         st.rerun()
 
-    if st.button("🔊 Test voice", use_container_width=True):
-        if not ENABLE_TTS:
-            st.info("Enable TTS first.")
-        else:
-            try:
-                audio = speak_edge_tts_bytes(
-                    "Hi. Tell me the asset, the currency, and whether it's a stock or a bond. "
-                    "I will estimate a fair value range with scenarios and key risks.",
-                    timeout_s=TTS_TIMEOUT_SECONDS,
-                )
-                st.session_state.last_audio = audio
-                st.success("Audio generated. If it doesn't autoplay, press play.")
-                st.audio(audio, format="audio/mpeg", autoplay=True)
-            except Exception as e:
-                st.error(f"TTS Error: {e}")
+    with st.expander("Limits / Settings"):
+        st.write("MAX_TOKENS:", MAX_TOKENS)
+        st.write("HISTORY_TURNS:", HISTORY_TURNS)
+        st.write("CONTINUE_PASSES:", CONTINUE_PASSES)
+        st.write("EXTRACT_MAX_CHARS:", EXTRACT_MAX_CHARS)
+        st.write("TTS_MAX_CHARS:", TTS_MAX_CHARS)
+        st.write("OpenRouter timeout:", OPENROUTER_TIMEOUT_READ)
 
     with st.expander("Diagnostics (optional)"):
         st.write("OpenRouter key loaded:", bool(OPENROUTER_API_KEY))
         st.write("Text model:", OPENROUTER_MODEL)
         st.write("Vision model:", OPENROUTER_VISION_MODEL or "(not set)")
-        st.write("OpenRouter read timeout:", OPENROUTER_TIMEOUT_READ)
         st.write("Edge voice:", EDGE_VOICE)
         st.write("Vosk path:", VOSK_MODEL_PATH)
         st.write("Vosk exists:", os.path.isdir(VOSK_MODEL_PATH))
@@ -607,11 +575,8 @@ if SHOW_DEBUG and st.session_state.debug_last_step:
 if st.session_state.last_audio:
     st.audio(st.session_state.last_audio, format="audio/mpeg", autoplay=True)
 
-# --------------------
-# Voice input (Press to speak) -> STT -> chat
-# --------------------
+# Voice input
 st.markdown("### 🎙️ Voice input (press to record, press again to stop)")
-
 mic = mic_recorder(
     start_prompt="🎙️ Start recording",
     stop_prompt="⏹️ Stop",
@@ -620,7 +585,7 @@ mic = mic_recorder(
     format="wav",
 )
 
-def _build_prompt_for_extracted_text(intake: str, user_text: str, extracted: str) -> str:
+def _prompt_from_extracted_text(intake: str, user_text: str, extracted: str) -> str:
     return f"""
 {intake}
 
@@ -629,30 +594,28 @@ You are a CFA-style valuation analyst.
 User message:
 {user_text}
 
-If the user is asking about the linked content:
-- Summarize key investable points (5–10 bullets max),
-- Then produce a fair value assessment.
+Use the extracted source text below. Summarize investable points and provide fair value assessment.
 
 Output format:
 1) Source summary
 2) Asset / thesis framing
 3) Valuation approach
-4) Key assumptions (explicit, with ranges)
+4) Key assumptions (ranges)
 5) Base/Bull/Bear intrinsic value + probability-weighted fair value
 6) Sensitivities (2 drivers)
 7) Risks + monitoring checklist
-8) Next data needed (only if required)
+8) Conclusion
 
 Rules:
 - Use only numbers explicitly present in the extracted text (do not guess).
-- If key numbers are missing, use placeholders and clearly label them.
+- If key numbers are missing, use placeholders and label assumptions.
 
 [BEGIN EXTRACTED TEXT]
 {extracted}
 [END EXTRACTED TEXT]
 """
 
-def _build_prompt_for_pdf_images(intake: str, user_text: str) -> str:
+def _prompt_from_pdf_images(intake: str, user_text: str) -> str:
     return f"""
 {intake}
 
@@ -661,26 +624,21 @@ You are a CFA-style valuation analyst.
 User message:
 {user_text}
 
-The link is an investor relations / earnings PDF slide deck that is image-heavy.
-Extract key financial figures ONLY if they are clearly visible (do not guess):
-- Revenue, gross margin, operating margin, EPS, FCF, guidance, segment KPIs, capex, share count, net debt/cash, etc.
+This is an image-heavy PDF earnings/IR slide deck.
+Extract key financial figures ONLY if visible (do not guess), then perform a fair value assessment.
 
-Then produce:
-1) Slide-extracted figures (with slide/page references like "page 2")
-2) Key investable takeaways (5–10 bullets)
-3) Valuation framework (choose methods that fit)
+Output:
+1) Slide-extracted figures (include page numbers)
+2) Key takeaways
+3) Valuation approach
 4) Assumptions (ranges)
 5) Base/Bull/Bear intrinsic value + probability-weighted fair value
-6) Sensitivities (2 drivers)
+6) Sensitivities
 7) Risks + monitoring checklist
-8) What additional data is needed (if any)
-
-Rules:
-- If a number is not visible, say it's not visible.
-- Keep it structured and professional.
+8) Conclusion
 """
 
-def _build_prompt_no_url(intake: str, user_text: str) -> str:
+def _prompt_no_url(intake: str, user_text: str) -> str:
     return f"""
 {intake}
 
@@ -689,24 +647,18 @@ You are a CFA-style valuation analyst.
 User message:
 {user_text}
 
-Task:
-Perform a fair value assessment (intrinsic value) appropriate for the asset type implied by the user.
-
-Rules:
-- If the asset/ticker/terms are unclear, infer carefully and ask 1–3 targeted questions ONLY if needed.
-- If current price is missing, still produce an intrinsic value range; note that margin-of-safety vs price requires price.
-- Do not fabricate recent financial data or specific historical revenues unless provided by the user/link/slides.
-- Provide ranges and confidence, not certainty.
+Task: Provide an intrinsic value (fair value) framework and estimate with Base/Bull/Bear scenarios.
+Do not fabricate financial statement numbers. Use ranges and clearly label assumptions.
 
 Output format:
 1) Asset summary
 2) Key value drivers
-3) Valuation method(s)
-4) Assumptions (with ranges)
+3) Valuation methods
+4) Assumptions (ranges)
 5) Base/Bull/Bear intrinsic value + probability-weighted fair value
-6) Sensitivity (2 drivers)
+6) Sensitivities
 7) Risks + monitoring checklist
-8) Next data needed (if any)
+8) Next data needed
 """
 
 def handle_user_message(text: str):
@@ -719,53 +671,38 @@ def handle_user_message(text: str):
         urls = extract_urls(text)
         intake = build_intake_preamble(text)
 
-        # 1) Build reply (URL-aware)
         if urls:
             st.session_state.status = "Reading link content…"
             st.session_state.debug_last_step = "fetch_link"
-            result = fetch_and_extract(urls[0])
+            result = fetch_and_extract(urls[0], max_chars=EXTRACT_MAX_CHARS)
 
             if result["type"] in ("html", "pdf_text"):
                 st.session_state.status = "Building valuation model…"
-                st.session_state.debug_last_step = "openrouter_text"
-                prompt = _build_prompt_for_extracted_text(intake, text, result["text"])
-                reply = ask_openrouter_text(prompt)
+                st.session_state.debug_last_step = "model_text"
+                prompt = _prompt_from_extracted_text(intake, text, result["text"])
+                reply = get_full_reply_text(prompt)
 
-            elif result["type"] == "pdf_images":
+            else:  # pdf_images
                 st.session_state.status = "Reading PDF slides…"
-                st.session_state.debug_last_step = "openrouter_vision"
-                prompt = _build_prompt_for_pdf_images(intake, text)
-
-                # If no vision model is set, be explicit instead of failing mysteriously
-                if not (OPENROUTER_VISION_MODEL.strip() or OPENROUTER_MODEL.strip()):
-                    raise RuntimeError("No model configured.")
-                if not OPENROUTER_VISION_MODEL.strip():
-                    st.warning(
-                        "PDF appears image-heavy. For best results, set OPENROUTER_VISION_MODEL "
-                        "to a vision-capable model. I will try the current model anyway."
-                    )
-
-                reply = ask_openrouter_vision(prompt, result["pdf_images"])
-            else:
-                reply = "I couldn't read the link content. Try another link or upload the PDF."
+                st.session_state.debug_last_step = "model_vision"
+                prompt = _prompt_from_pdf_images(intake, text)
+                reply = get_full_reply_vision(prompt, result["pdf_images"])
         else:
             st.session_state.status = "Building valuation model…"
-            st.session_state.debug_last_step = "openrouter_text"
-            prompt = _build_prompt_no_url(intake, text)
-            reply = ask_openrouter_text(prompt)
+            st.session_state.debug_last_step = "model_text"
+            prompt = _prompt_no_url(intake, text)
+            reply = get_full_reply_text(prompt)
 
-        # 2) Append text reply FIRST (so user sees output even if TTS fails)
-        st.session_state.debug_last_step = "append_reply"
+        # Show reply first
         st.session_state.chat.append({"role": "assistant", "content": reply})
         st.session_state.status = ""
 
-        # 3) Optional TTS
+        # Optional TTS (longer cap)
         if ENABLE_TTS:
             try:
                 st.session_state.status = "Generating audio…"
                 st.session_state.debug_last_step = "tts"
-                SAFE_TTS_CHARS = 600
-                tts_text = clean_for_tts(reply[:SAFE_TTS_CHARS])
+                tts_text = clean_for_tts(reply[:TTS_MAX_CHARS])
                 audio = speak_edge_tts_bytes(tts_text, timeout_s=TTS_TIMEOUT_SECONDS)
                 st.session_state.last_audio = audio
             except Exception as e:
@@ -780,7 +717,7 @@ def handle_user_message(text: str):
         st.session_state.debug_last_step = f"error: {type(e).__name__}"
         st.error(f"Error: {e}")
 
-# If mic recorded something, transcribe and send to chat
+# Mic processing
 if mic and mic.get("bytes"):
     st.session_state.status = "Transcribing audio…"
     st.session_state.debug_last_step = "stt"
@@ -797,9 +734,7 @@ if mic and mic.get("bytes"):
         st.session_state.status = ""
         st.error(f"Transcription failed: {e}")
 
-# --------------------
 # Text input
-# --------------------
 user_text = st.chat_input("Ask for a valuation (e.g., 'Value AAPL with a 3-scenario DCF') or paste a link…")
 if user_text:
     handle_user_message(user_text)
@@ -812,14 +747,10 @@ if len(st.session_state.chat) == 0:
             "role": "assistant",
             "content": (
                 "Hi — I’m your CFA-style valuation analyst.\n\n"
-                "Tell me:\n"
-                "- The asset (ticker/ISIN), asset type (stock/bond/ETF/crypto), and currency\n"
-                "- Your horizon (optional)\n"
-                "- Any inputs you already have (price, revenue, margins, yield, maturity, etc.)\n\n"
-                "You can paste a link (filing/news) and I’ll extract investable points.\n"
-                "If you paste a PDF slide deck, I’ll try text extraction first; if it’s image-heavy, I’ll switch to slide-image reading.\n\n"
-                "Warm-up example:\n"
-                "👉 “Value AAPL using a 3-scenario DCF with conservative assumptions and show sensitivities.”"
+                "Tell me the asset (ticker/ISIN), asset type (stock/bond/ETF/crypto), currency, and any key inputs you have.\n"
+                "You can paste a link (HTML or PDF). For image-heavy PDF slide decks, I can render pages and read the slides.\n\n"
+                "Example:\n"
+                "👉 “Value AAPL using a 3-scenario DCF and show sensitivities.”"
             ),
         }
     )
