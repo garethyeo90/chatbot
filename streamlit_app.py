@@ -1,7 +1,8 @@
 # streamlit_app.py
 # Streamlit Cloud friendly CFA-style Fair Value Analyst voice chatbot:
-# - Chat: OpenRouter
-# - TTS: edge-tts (MP3 bytes) with HARD TIMEOUT + optional toggle
+# - Chat: OpenRouter (text + optional vision)
+# - URL ingestion: HTML + PDF (text extract) + PDF (image render fallback for slide decks like Workiva)
+# - TTS: edge-tts (MP3 bytes) with HARD TIMEOUT + toggle
 # - STT: Vosk (offline) + streamlit-mic-recorder (WAV)
 #
 # requirements.txt (minimum):
@@ -15,6 +16,8 @@
 # numpy
 # soundfile
 # scipy
+# pymupdf
+# Pillow
 #
 # IMPORTANT:
 # 1) Put your Vosk model folder in the repo, e.g.
@@ -22,11 +25,12 @@
 # 2) Streamlit Secrets:
 #    OPENROUTER_API_KEY="..."
 #    (optional) OPENROUTER_MODEL="deepseek/deepseek-v3.2"
+#    (optional) OPENROUTER_VISION_MODEL="..."  # MUST be a vision-capable model if you want PDF slide images parsed
 #    (optional) EDGE_VOICE="en-US-JennyNeural"
 #    (optional) EDGE_RATE="-10%"
 #    (optional) EDGE_VOLUME="+0%"
 #    (optional) VOSK_MODEL_PATH="models/vosk-model-small-en-us-0.15"
-#    (optional) OPENROUTER_TIMEOUT_READ=90
+#    (optional) OPENROUTER_TIMEOUT_READ=240
 #    (optional) TTS_TIMEOUT_SECONDS=20
 
 import os
@@ -34,6 +38,9 @@ import re
 import io
 import json
 import asyncio
+import base64
+from typing import List, Dict, Any, Optional
+
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
@@ -44,6 +51,9 @@ import soundfile as sf
 from scipy.signal import resample_poly
 from vosk import Model, KaldiRecognizer
 from streamlit_mic_recorder import mic_recorder
+
+import fitz  # PyMuPDF
+
 
 # --------------------
 # Page config
@@ -62,7 +72,8 @@ def get_secret(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "anthropic/claude-opus-4.6")
+OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "deepseek/deepseek-v3.2")
+OPENROUTER_VISION_MODEL = get_secret("OPENROUTER_VISION_MODEL", "")  # optional, must be vision-capable
 
 EDGE_VOICE = get_secret("EDGE_VOICE", "en-US-JennyNeural")
 EDGE_RATE = get_secret("EDGE_RATE", "-10%")
@@ -70,17 +81,16 @@ EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 
 VOSK_MODEL_PATH = get_secret("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
 
-# Optional tuning
-OPENROUTER_TIMEOUT_READ = int(get_secret("OPENROUTER_TIMEOUT_READ", "300"))  # seconds
-TTS_TIMEOUT_SECONDS = int(get_secret("TTS_TIMEOUT_SECONDS", "300"))          # seconds
+OPENROUTER_TIMEOUT_READ = int(get_secret("OPENROUTER_TIMEOUT_READ", "240"))
+TTS_TIMEOUT_SECONDS = int(get_secret("TTS_TIMEOUT_SECONDS", "20"))
 
 # --------------------
-# Models / endpoints
+# Endpoints
 # --------------------
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # --------------------
-# CFA Persona (Fair Value Analyst)
+# CFA Persona
 # --------------------
 PERSONA = """
 ROLE (STRICT):
@@ -108,7 +118,7 @@ CORE DELIVERABLES (DEFAULT OUTPUT TEMPLATE):
 8) Next data needed (only if required)
 
 DISCIPLINE RULES:
-- Never fabricate “latest numbers.” If the user doesn’t provide them or link text doesn’t contain them, do NOT state specific historical revenue/EPS figures.
+- Never fabricate “latest numbers.” If the user doesn’t provide them or link text/slides don’t contain them, do NOT state specific historical revenue/EPS figures.
 - If data is missing, proceed with a transparent framework and clearly label illustrative assumptions.
 - Provide ranges and confidence, not certainty.
 
@@ -118,41 +128,17 @@ Proceed with a base-case model using stated assumptions.
 """
 
 # --------------------
-# URL detection & parsing
+# URL detection
 # --------------------
 URL_RE = re.compile(r"(https?://[^\s]+)")
 
-def extract_urls(text: str):
+def extract_urls(text: str) -> List[str]:
     return URL_RE.findall(text or "")
 
-def fetch_and_extract(url: str, max_chars: int = 12000) -> str:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers, timeout=20)
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "lxml")
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
-        tag.decompose()
-
-    main = soup.find("article") or soup.find("main") or soup.body
-    text = main.get_text("\n") if main else soup.get_text("\n")
-
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    cleaned = "\n".join(lines)
-
-    title = soup.title.get_text(strip=True) if soup.title else ""
-    if title:
-        cleaned = f"Title: {title}\n\n{cleaned}"
-
-    if len(cleaned) > max_chars:
-        cleaned = cleaned[:max_chars] + "\n...(truncated)"
-
-    return cleaned
-
 # --------------------
-# Lightweight asset intake helper (Point 5)
+# Asset intake helper (Point 5)
 # --------------------
-TICKER_RE = re.compile(r"\b[A-Z]{1,6}(\.[A-Z]{1,3})?\b")  # e.g., AAPL, BRK.B
+TICKER_RE = re.compile(r"\b[A-Z]{1,6}(\.[A-Z]{1,3})?\b")
 ISIN_RE = re.compile(r"\b[A-Z]{2}[A-Z0-9]{10}\b")
 CUSIP_RE = re.compile(r"\b[0-9A-Z]{9}\b")
 
@@ -238,7 +224,7 @@ def detect_horizon(text: str) -> str:
         return "long-term (3+ years)"
     return "not specified (assume multi-year valuation horizon)"
 
-def extract_identifiers(text: str):
+def extract_identifiers(text: str) -> Dict[str, List[str]]:
     raw = text or ""
     isin = ISIN_RE.findall(raw)
     cusip = CUSIP_RE.findall(raw)
@@ -256,18 +242,13 @@ def extract_identifiers(text: str):
                 out.append(x)
         return out
 
-    return {
-        "tickers": uniq(tickers)[:5],
-        "isin": uniq(isin)[:3],
-        "cusip": uniq(cusip)[:3],
-    }
+    return {"tickers": uniq(tickers)[:5], "isin": uniq(isin)[:3], "cusip": uniq(cusip)[:3]}
 
 def build_intake_preamble(user_text: str) -> str:
     asset_type = detect_asset_type(user_text)
     currency = detect_currency(user_text)
     horizon = detect_horizon(user_text)
     ids = extract_identifiers(user_text)
-
     return f"""
 [INTAKE (auto-detected, may be wrong)]
 - Asset type guess: {asset_type}
@@ -278,27 +259,127 @@ def build_intake_preamble(user_text: str) -> str:
 """
 
 # --------------------
-# OpenRouter chat
+# PDF handling: text extraction + image render fallback
 # --------------------
-def ask_openrouter(user_text: str) -> str:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("Missing OPENROUTER_API_KEY (set Streamlit Cloud Secrets).")
+def is_probably_pdf(url: str, content_type: str = "") -> bool:
+    u = (url or "").lower()
+    ct = (content_type or "").lower()
+    return u.endswith(".pdf") or "application/pdf" in ct or "pdf" in ct
 
-    st.session_state.messages.append({"role": "user", "content": user_text})
+def text_quality_ok(text: str, min_chars: int = 800) -> bool:
+    if not text:
+        return False
+    s = text.strip()
+    if len(s) < min_chars:
+        return False
+    printable = sum(ch.isprintable() for ch in s)
+    ratio = printable / max(1, len(s))
+    return ratio > 0.92
 
-    r = requests.post(
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 12) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    chunks = []
+    pages = min(max_pages, doc.page_count)
+    for i in range(pages):
+        page = doc.load_page(i)
+        chunks.append(page.get_text("text"))
+    doc.close()
+    return "\n".join(c.strip() for c in chunks if c and c.strip())
+
+def render_pdf_pages_to_png_bytes(pdf_bytes: bytes, max_pages: int = 4, zoom: float = 2.0) -> List[bytes]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out = []
+    pages = min(max_pages, doc.page_count)
+    mat = fitz.Matrix(zoom, zoom)
+    for i in range(pages):
+        page = doc.load_page(i)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        out.append(pix.tobytes("png"))
+    doc.close()
+    return out
+
+def fetch_and_extract(url: str, max_chars: int = 12000) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        "type": "html" | "pdf_text" | "pdf_images",
+        "text": "...",
+        "pdf_images": [png_bytes, ...],
+        "meta": {"content_type": "...", "final_url": "..."}
+      }
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
+    r.raise_for_status()
+
+    content_type = r.headers.get("Content-Type", "")
+    raw = r.content
+    final_url = r.url
+
+    if is_probably_pdf(final_url, content_type) or raw[:4] == b"%PDF":
+        text = extract_text_from_pdf_bytes(raw, max_pages=12)
+        if text_quality_ok(text):
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n...(truncated)"
+            return {"type": "pdf_text", "text": text, "pdf_images": [], "meta": {"content_type": content_type, "final_url": final_url}}
+
+        imgs = render_pdf_pages_to_png_bytes(raw, max_pages=4, zoom=2.0)
+        return {"type": "pdf_images", "text": "", "pdf_images": imgs, "meta": {"content_type": content_type, "final_url": final_url}}
+
+    # HTML path
+    html = r.text
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
+        tag.decompose()
+
+    main = soup.find("article") or soup.find("main") or soup.body
+    text = main.get_text("\n") if main else soup.get_text("\n")
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    cleaned = "\n".join(lines)
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    if title:
+        cleaned = f"Title: {title}\n\n{cleaned}"
+
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars] + "\n...(truncated)"
+
+    return {"type": "html", "text": cleaned, "pdf_images": [], "meta": {"content_type": content_type, "final_url": final_url}}
+
+# --------------------
+# OpenRouter: text + vision
+# --------------------
+def _openrouter_post(messages: List[Dict[str, Any]], model_name: str) -> requests.Response:
+    return requests.post(
         OPENROUTER_URL,
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
         },
         json={
-            "model": OPENROUTER_MODEL,
-            "messages": st.session_state.messages,
+            "model": model_name,
+            "messages": messages,
             "temperature": 0.35,
+            "max_tokens": 900,
         },
         timeout=(15, OPENROUTER_TIMEOUT_READ),
     )
+
+def ask_openrouter_text(user_text: str) -> str:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("Missing OPENROUTER_API_KEY (set Streamlit Cloud Secrets).")
+
+    st.session_state.messages.append({"role": "user", "content": user_text})
+
+    r = _openrouter_post(st.session_state.messages, OPENROUTER_MODEL)
+
+    # fallback on common failures
+    if r.status_code in (403, 404, 429, 500, 502, 503, 504):
+        fallback = "deepseek/deepseek-v3.2"
+        if OPENROUTER_MODEL != fallback:
+            st.warning(f"Model '{OPENROUTER_MODEL}' failed ({r.status_code}). Falling back to {fallback}.")
+            r = _openrouter_post(st.session_state.messages, fallback)
 
     if r.status_code == 401:
         raise RuntimeError("OpenRouter 401: API key rejected (check Secrets).")
@@ -307,14 +388,48 @@ def ask_openrouter(user_text: str) -> str:
     if r.status_code == 403:
         raise RuntimeError("OpenRouter 403: model access denied (try another model).")
     if r.status_code >= 400:
-        raise RuntimeError(f"OpenRouter error {r.status_code}: {r.text[:400]}")
+        raise RuntimeError(f"OpenRouter error {r.status_code}: {r.text[:600]}")
 
     data = r.json()
     reply = data["choices"][0]["message"]["content"]
     st.session_state.messages.append({"role": "assistant", "content": reply})
     return reply
 
-def openrouter_ping():
+def ask_openrouter_vision(user_text: str, png_images: List[bytes]) -> str:
+    """
+    Sends user_text + images to a vision-capable model.
+    Requires OPENROUTER_VISION_MODEL in Secrets (or will fallback to OPENROUTER_MODEL).
+    """
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("Missing OPENROUTER_API_KEY (set Streamlit Cloud Secrets).")
+
+    model_name = OPENROUTER_VISION_MODEL.strip() or OPENROUTER_MODEL
+
+    content_parts: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
+    for b in png_images:
+        b64 = base64.b64encode(b).decode("utf-8")
+        content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+
+    st.session_state.messages.append({"role": "user", "content": content_parts})
+
+    r = _openrouter_post(st.session_state.messages, model_name)
+
+    if r.status_code in (403, 404, 429, 500, 502, 503, 504) and model_name != OPENROUTER_MODEL:
+        st.warning(f"Vision model '{model_name}' failed ({r.status_code}). Trying text model '{OPENROUTER_MODEL}' (may not support images).")
+        r = _openrouter_post(st.session_state.messages, OPENROUTER_MODEL)
+
+    if r.status_code >= 400:
+        raise RuntimeError(
+            "Vision request failed. Ensure OPENROUTER_VISION_MODEL is set to a vision-capable model. "
+            f"Status {r.status_code}: {r.text[:600]}"
+        )
+
+    data = r.json()
+    reply = data["choices"][0]["message"]["content"]
+    st.session_state.messages.append({"role": "assistant", "content": reply})
+    return reply
+
+def openrouter_ping() -> (int, str):
     if not OPENROUTER_API_KEY:
         return 0, "Missing OPENROUTER_API_KEY"
     r = requests.post(
@@ -327,14 +442,14 @@ def openrouter_ping():
             "model": OPENROUTER_MODEL,
             "messages": [{"role": "user", "content": "Say OK"}],
             "temperature": 0.0,
-            "max_tokens": 900,
+            "max_tokens": 16,
         },
-        timeout=(15, 240),
+        timeout=(10, 25),
     )
     return r.status_code, r.text[:600]
 
 # --------------------
-# TTS helpers (with hard timeout)
+# TTS (hard timeout)
 # --------------------
 def clean_for_tts(text: str) -> str:
     repl = {
@@ -368,11 +483,9 @@ def speak_edge_tts_bytes(text: str, timeout_s: int = 20) -> bytes:
     async def _run():
         return await asyncio.wait_for(_gen_audio(), timeout=timeout_s)
 
-    # asyncio.run can fail if an event loop is already running; guard for that
     try:
         return asyncio.run(_run())
     except RuntimeError:
-        # Fallback for environments with a running event loop
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
@@ -456,7 +569,7 @@ with st.sidebar:
         else:
             try:
                 audio = speak_edge_tts_bytes(
-                    "Hi. Tell me the asset, the currency, and whether it's a stock or bond. "
+                    "Hi. Tell me the asset, the currency, and whether it's a stock or a bond. "
                     "I will estimate a fair value range with scenarios and key risks.",
                     timeout_s=TTS_TIMEOUT_SECONDS,
                 )
@@ -468,13 +581,13 @@ with st.sidebar:
 
     with st.expander("Diagnostics (optional)"):
         st.write("OpenRouter key loaded:", bool(OPENROUTER_API_KEY))
-        st.write("Model:", OPENROUTER_MODEL)
+        st.write("Text model:", OPENROUTER_MODEL)
+        st.write("Vision model:", OPENROUTER_VISION_MODEL or "(not set)")
+        st.write("OpenRouter read timeout:", OPENROUTER_TIMEOUT_READ)
         st.write("Edge voice:", EDGE_VOICE)
         st.write("Vosk path:", VOSK_MODEL_PATH)
         st.write("Vosk exists:", os.path.isdir(VOSK_MODEL_PATH))
-        st.write("OpenRouter read timeout:", OPENROUTER_TIMEOUT_READ)
-        st.write("TTS timeout seconds:", TTS_TIMEOUT_SECONDS)
-        if st.button("Test OpenRouter"):
+        if st.button("Test OpenRouter (text)"):
             code, body = openrouter_ping()
             st.write("Status:", code)
             st.code(body)
@@ -484,7 +597,7 @@ for m in st.session_state.chat:
     with st.chat_message("user" if m["role"] == "user" else "assistant"):
         st.markdown(m["content"])
 
-# Status + audio
+# Status + debug + audio
 if st.session_state.status:
     st.info(st.session_state.status)
 
@@ -507,70 +620,82 @@ mic = mic_recorder(
     format="wav",
 )
 
-def handle_user_message(text: str):
-    st.session_state.chat.append({"role": "user", "content": text})
-    st.session_state.status = "Analyzing…"
-    st.session_state.last_audio = None
-    st.session_state.debug_last_step = "start"
-
-    try:
-        urls = extract_urls(text)
-        intake = build_intake_preamble(text)
-
-        # 1) Build prompt (+ fetch link text if needed)
-        st.session_state.debug_last_step = "build_prompt"
-        if urls:
-            st.session_state.status = "Reading link content…"
-            st.session_state.debug_last_step = "fetch_link"
-            content = fetch_and_extract(urls[0])
-
-            prompt = f"""
-{intake}
-
-You are a CFA-style valuation analyst. Use the prior conversation context.
-
-User message:
-{text}
-
-If the user is asking about the linked content:
-- First summarize the key investable points from the link (5–10 bullets max),
-- Then produce a fair value assessment with a clear method and assumptions.
-
-Output format:
-A) Link summary (5-10 bullets max)
-B) Asset / thesis framing (what asset, what question)
-C) Valuation approach (methods chosen and why)
-D) Key assumptions (explicit, with ranges)
-E) Base/Bull/Bear intrinsic value and probability-weighted fair value
-F) Sensitivities (2 key drivers)
-G) Risks & what would change your view
-H) Next data needed (only if required)
-
-Rules:
-- Do NOT invent financial figures not supported by the link text or user-provided numbers.
-- If numbers are missing, proceed with a framework + placeholder variables and clearly label them.
-- Keep it professional and readable.
-
-[BEGIN LINK TEXT]
-{content}
-[END LINK TEXT]
-"""
-        else:
-            prompt = f"""
+def _build_prompt_for_extracted_text(intake: str, user_text: str, extracted: str) -> str:
+    return f"""
 {intake}
 
 You are a CFA-style valuation analyst.
 
 User message:
-{text}
+{user_text}
+
+If the user is asking about the linked content:
+- Summarize key investable points (5–10 bullets max),
+- Then produce a fair value assessment.
+
+Output format:
+1) Source summary
+2) Asset / thesis framing
+3) Valuation approach
+4) Key assumptions (explicit, with ranges)
+5) Base/Bull/Bear intrinsic value + probability-weighted fair value
+6) Sensitivities (2 drivers)
+7) Risks + monitoring checklist
+8) Next data needed (only if required)
+
+Rules:
+- Use only numbers explicitly present in the extracted text (do not guess).
+- If key numbers are missing, use placeholders and clearly label them.
+
+[BEGIN EXTRACTED TEXT]
+{extracted}
+[END EXTRACTED TEXT]
+"""
+
+def _build_prompt_for_pdf_images(intake: str, user_text: str) -> str:
+    return f"""
+{intake}
+
+You are a CFA-style valuation analyst.
+
+User message:
+{user_text}
+
+The link is an investor relations / earnings PDF slide deck that is image-heavy.
+Extract key financial figures ONLY if they are clearly visible (do not guess):
+- Revenue, gross margin, operating margin, EPS, FCF, guidance, segment KPIs, capex, share count, net debt/cash, etc.
+
+Then produce:
+1) Slide-extracted figures (with slide/page references like "page 2")
+2) Key investable takeaways (5–10 bullets)
+3) Valuation framework (choose methods that fit)
+4) Assumptions (ranges)
+5) Base/Bull/Bear intrinsic value + probability-weighted fair value
+6) Sensitivities (2 drivers)
+7) Risks + monitoring checklist
+8) What additional data is needed (if any)
+
+Rules:
+- If a number is not visible, say it's not visible.
+- Keep it structured and professional.
+"""
+
+def _build_prompt_no_url(intake: str, user_text: str) -> str:
+    return f"""
+{intake}
+
+You are a CFA-style valuation analyst.
+
+User message:
+{user_text}
 
 Task:
 Perform a fair value assessment (intrinsic value) appropriate for the asset type implied by the user.
 
 Rules:
 - If the asset/ticker/terms are unclear, infer carefully and ask 1–3 targeted questions ONLY if needed.
-- If the user did not provide current price, still produce an intrinsic value range; note that margin-of-safety vs price requires price.
-- Do not fabricate recent financial data or specific historical revenues unless provided by the user/link text.
+- If current price is missing, still produce an intrinsic value range; note that margin-of-safety vs price requires price.
+- Do not fabricate recent financial data or specific historical revenues unless provided by the user/link/slides.
 - Provide ranges and confidence, not certainty.
 
 Output format:
@@ -584,27 +709,66 @@ Output format:
 8) Next data needed (if any)
 """
 
-        # 2) Call OpenRouter
-        st.session_state.status = "Building valuation model…"
-        st.session_state.debug_last_step = "openrouter_call"
-        reply = ask_openrouter(prompt)
+def handle_user_message(text: str):
+    st.session_state.chat.append({"role": "user", "content": text})
+    st.session_state.status = "Analyzing…"
+    st.session_state.last_audio = None
+    st.session_state.debug_last_step = "start"
 
-        # 3) Append the text reply FIRST (so user will see it even if TTS fails)
+    try:
+        urls = extract_urls(text)
+        intake = build_intake_preamble(text)
+
+        # 1) Build reply (URL-aware)
+        if urls:
+            st.session_state.status = "Reading link content…"
+            st.session_state.debug_last_step = "fetch_link"
+            result = fetch_and_extract(urls[0])
+
+            if result["type"] in ("html", "pdf_text"):
+                st.session_state.status = "Building valuation model…"
+                st.session_state.debug_last_step = "openrouter_text"
+                prompt = _build_prompt_for_extracted_text(intake, text, result["text"])
+                reply = ask_openrouter_text(prompt)
+
+            elif result["type"] == "pdf_images":
+                st.session_state.status = "Reading PDF slides…"
+                st.session_state.debug_last_step = "openrouter_vision"
+                prompt = _build_prompt_for_pdf_images(intake, text)
+
+                # If no vision model is set, be explicit instead of failing mysteriously
+                if not (OPENROUTER_VISION_MODEL.strip() or OPENROUTER_MODEL.strip()):
+                    raise RuntimeError("No model configured.")
+                if not OPENROUTER_VISION_MODEL.strip():
+                    st.warning(
+                        "PDF appears image-heavy. For best results, set OPENROUTER_VISION_MODEL "
+                        "to a vision-capable model. I will try the current model anyway."
+                    )
+
+                reply = ask_openrouter_vision(prompt, result["pdf_images"])
+            else:
+                reply = "I couldn't read the link content. Try another link or upload the PDF."
+        else:
+            st.session_state.status = "Building valuation model…"
+            st.session_state.debug_last_step = "openrouter_text"
+            prompt = _build_prompt_no_url(intake, text)
+            reply = ask_openrouter_text(prompt)
+
+        # 2) Append text reply FIRST (so user sees output even if TTS fails)
         st.session_state.debug_last_step = "append_reply"
         st.session_state.chat.append({"role": "assistant", "content": reply})
-        st.session_state.status = ""  # clear status so UI can render text
+        st.session_state.status = ""
 
-        # 4) Optional TTS (guarded + timed)
+        # 3) Optional TTS
         if ENABLE_TTS:
             try:
                 st.session_state.status = "Generating audio…"
                 st.session_state.debug_last_step = "tts"
-                SAFE_TTS_CHARS = 600  # smaller reduces hang risk
+                SAFE_TTS_CHARS = 600
                 tts_text = clean_for_tts(reply[:SAFE_TTS_CHARS])
                 audio = speak_edge_tts_bytes(tts_text, timeout_s=TTS_TIMEOUT_SECONDS)
                 st.session_state.last_audio = audio
             except Exception as e:
-                # Do NOT block output; show a warning and continue
                 st.warning(f"TTS failed (text reply shown): {e}")
             finally:
                 st.session_state.status = ""
@@ -652,7 +816,8 @@ if len(st.session_state.chat) == 0:
                 "- The asset (ticker/ISIN), asset type (stock/bond/ETF/crypto), and currency\n"
                 "- Your horizon (optional)\n"
                 "- Any inputs you already have (price, revenue, margins, yield, maturity, etc.)\n\n"
-                "You can also paste a link (filing/news) and I’ll extract investable points.\n\n"
+                "You can paste a link (filing/news) and I’ll extract investable points.\n"
+                "If you paste a PDF slide deck, I’ll try text extraction first; if it’s image-heavy, I’ll switch to slide-image reading.\n\n"
                 "Warm-up example:\n"
                 "👉 “Value AAPL using a 3-scenario DCF with conservative assumptions and show sensitivities.”"
             ),
