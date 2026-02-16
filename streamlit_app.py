@@ -1,7 +1,7 @@
 # streamlit_app.py
 # Streamlit Cloud friendly CFA-style Fair Value Analyst voice chatbot:
 # - Chat: OpenRouter
-# - TTS: edge-tts (MP3 bytes)
+# - TTS: edge-tts (MP3 bytes) with HARD TIMEOUT + optional toggle
 # - STT: Vosk (offline) + streamlit-mic-recorder (WAV)
 #
 # requirements.txt (minimum):
@@ -19,7 +19,6 @@
 # IMPORTANT:
 # 1) Put your Vosk model folder in the repo, e.g.
 #    models/vosk-model-small-en-us-0.15/{am,conf,graph,ivector,...}
-#    (Or use another model and set VOSK_MODEL_PATH in Secrets.)
 # 2) Streamlit Secrets:
 #    OPENROUTER_API_KEY="..."
 #    (optional) OPENROUTER_MODEL="deepseek/deepseek-v3.2"
@@ -27,6 +26,8 @@
 #    (optional) EDGE_RATE="-10%"
 #    (optional) EDGE_VOLUME="+0%"
 #    (optional) VOSK_MODEL_PATH="models/vosk-model-small-en-us-0.15"
+#    (optional) OPENROUTER_TIMEOUT_READ=90
+#    (optional) TTS_TIMEOUT_SECONDS=20
 
 import os
 import re
@@ -69,6 +70,10 @@ EDGE_VOLUME = get_secret("EDGE_VOLUME", "+0%")
 
 VOSK_MODEL_PATH = get_secret("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
 
+# Optional tuning
+OPENROUTER_TIMEOUT_READ = int(get_secret("OPENROUTER_TIMEOUT_READ", "90"))  # seconds
+TTS_TIMEOUT_SECONDS = int(get_secret("TTS_TIMEOUT_SECONDS", "20"))          # seconds
+
 # --------------------
 # Models / endpoints
 # --------------------
@@ -84,36 +89,31 @@ Your job is to perform deep fair value assessment of financial assets and commun
 
 SCOPE:
 - Public equities, ETFs, bonds/credit, commodities (spot/forward logic), FX, crypto, private business proxies (with explicit caveats).
-- You can analyze a company, a single security, or a portfolio.
 - You DO NOT give personalized financial advice. You provide an educational, analytical fair value estimate based on stated assumptions.
 
 STYLE:
 - Clear, structured, investment-memo format.
 - Ask for missing inputs only if truly necessary; otherwise proceed with reasonable assumptions and state them explicitly.
-- Always show methodology and key drivers. No hand-waving.
-- Use concise bullets and text tables when helpful.
+- Always show methodology and key drivers.
 - Separate facts vs assumptions vs outputs.
 
 CORE DELIVERABLES (DEFAULT OUTPUT TEMPLATE):
 1) Asset summary (ticker/ISIN, currency, sector, business model / instrument terms)
-2) Key questions & value drivers
-3) Valuation methods used (choose what fits):
-   - Equity: DCF (FCFF or FCFE), Dividend model, Residual income, Multiples (EV/EBITDA, P/E, P/B), SOTP, scenarios.
-   - Credit: Spread / YTM, default probability, recovery, duration/convexity, liquidity/covenant risk.
-   - Macro assets: carry, roll-down, risk premium decomposition, regime scenarios.
-4) Assumptions (discount rate build-up, growth, margins, reinvestment, terminal value, capital structure, taxes, working capital)
-5) Base / Bull / Bear intrinsic value range and probability-weighted fair value
-6) Sensitivity (at least 2 key drivers) + what would change your view
-7) Risks (fundamental, financial, governance, macro, liquidity)
-8) Conclusion: Fair value range, margin of safety vs current price (if provided), monitoring checklist
+2) Key value drivers
+3) Valuation method(s) and why
+4) Assumptions (discount rate build-up, growth, margins, reinvestment, terminal value, capital structure)
+5) Base / Bull / Bear intrinsic value range + probability-weighted fair value
+6) Sensitivity (at least 2 key drivers)
+7) Risks + monitoring checklist
+8) Next data needed (only if required)
 
 DISCIPLINE RULES:
-- Never fabricate “latest numbers.” If the user doesn’t provide them, request them OR use the user-provided URL content and clearly label any estimates.
-- Avoid certainty. Provide ranges and confidence.
-- If user is inexperienced, keep language accessible and avoid urging trades.
+- Never fabricate “latest numbers.” If the user doesn’t provide them or link text doesn’t contain them, do NOT state specific historical revenue/EPS figures.
+- If data is missing, proceed with a transparent framework and clearly label illustrative assumptions.
+- Provide ranges and confidence, not certainty.
 
 INTERACTION:
-Determine asset type (equity/credit/etc), horizon, currency, and what “fair value” means (intrinsic vs relative).
+Determine asset type, horizon, currency, and what “fair value” means (intrinsic vs relative).
 Proceed with a base-case model using stated assumptions.
 """
 
@@ -152,36 +152,29 @@ def fetch_and_extract(url: str, max_chars: int = 12000) -> str:
 # --------------------
 # Lightweight asset intake helper (Point 5)
 # --------------------
-TICKER_RE = re.compile(r"\b[A-Z]{1,6}(\.[A-Z]{1,3})?\b")  # e.g., AAPL, BRK.B, 0700.HK (won't catch digits)
+TICKER_RE = re.compile(r"\b[A-Z]{1,6}(\.[A-Z]{1,3})?\b")  # e.g., AAPL, BRK.B
 ISIN_RE = re.compile(r"\b[A-Z]{2}[A-Z0-9]{10}\b")
 CUSIP_RE = re.compile(r"\b[0-9A-Z]{9}\b")
 
 def detect_asset_type(text: str) -> str:
     t = (text or "").lower()
 
-    # Credit / fixed income cues
     credit_kw = [
         "bond", "coupon", "yield", "ytm", "duration", "convexity", "spread",
         "oas", "cds", "default", "recovery", "maturity", "callable", "putable",
         "senior", "subordinated", "covenant"
     ]
-    # Equity cues
     equity_kw = [
         "stock", "equity", "shares", "eps", "pe", "p/e", "ev/ebitda", "ebitda",
         "free cash flow", "fcf", "fcff", "fcfe", "wacc", "terminal value",
-        "dividend", "ddm", "buyback", "margin", "revenue", "guidance"
+        "dividend", "ddm", "buyback", "margin", "revenue", "guidance", "dcf"
     ]
-    # ETF / fund cues
     fund_kw = ["etf", "index fund", "mutual fund", "ucits", "fund"]
-    # FX cues
-    fx_kw = ["fx", "forex", "usd", "eur", "jpy", "gbp", "aud", "cad", "chf", "cny", "sgd", "exchange rate", "spot", "forward"]
-    # Crypto cues
+    fx_kw = ["fx", "forex", "exchange rate", "spot", "forward", "usd", "eur", "jpy", "gbp", "aud", "cad", "chf", "cny", "sgd"]
     crypto_kw = ["crypto", "bitcoin", "btc", "ethereum", "eth", "token", "on-chain", "staking", "hashrate"]
-    # Commodity cues
     cmdty_kw = ["oil", "brent", "wti", "gold", "silver", "copper", "commodity", "futures", "contango", "backwardation", "inventory"]
 
     score = {"equity": 0, "credit": 0, "fund": 0, "fx": 0, "crypto": 0, "commodity": 0}
-
     for k in credit_kw:
         if k in t:
             score["credit"] += 1
@@ -201,7 +194,6 @@ def detect_asset_type(text: str) -> str:
         if k in t:
             score["commodity"] += 1
 
-    # Heuristic: if "bond" appears, prefer credit even if other words appear
     if "bond" in t or "ytm" in t or "coupon" in t:
         return "credit"
 
@@ -210,9 +202,10 @@ def detect_asset_type(text: str) -> str:
 
 def detect_currency(text: str) -> str:
     t = (text or "").upper()
-    # order matters: match common currency codes and symbols
     if "SGD" in t or "S$" in t:
         return "SGD"
+    if "HKD" in t or "HK$" in t:
+        return "HKD"
     if "USD" in t or "$" in t:
         return "USD"
     if "EUR" in t or "€" in t:
@@ -223,8 +216,6 @@ def detect_currency(text: str) -> str:
         return "JPY"
     if "CNY" in t or "RMB" in t:
         return "CNY"
-    if "HKD" in t or "HK$" in t:
-        return "HKD"
     if "AUD" in t:
         return "AUD"
     if "CAD" in t:
@@ -235,7 +226,6 @@ def detect_currency(text: str) -> str:
 
 def detect_horizon(text: str) -> str:
     t = (text or "").lower()
-    # quick heuristic horizons
     if any(k in t for k in ["intraday", "today", "this week", "1 week", "one week"]):
         return "short-term (days to 1 week)"
     if any(k in t for k in ["1 month", "one month", "3 months", "quarter"]):
@@ -246,18 +236,17 @@ def detect_horizon(text: str) -> str:
         return "12 months"
     if any(k in t for k in ["3 years", "5 years", "10 years", "long term", "long-term"]):
         return "long-term (3+ years)"
-    # valuation default horizon is often multi-year
-    return "valuation horizon not specified (assume 5–10yr DCF where applicable)"
+    return "not specified (assume multi-year valuation horizon)"
 
 def extract_identifiers(text: str):
     raw = text or ""
     isin = ISIN_RE.findall(raw)
     cusip = CUSIP_RE.findall(raw)
-    # ticker extraction can be noisy (e.g., "DCF", "WACC"), so filter common finance acronyms
-    blacklist = {"DCF", "WACC", "FCF", "FCFF", "FCFE", "EBITDA", "EPS", "PE", "P", "EV", "IRR", "NPV", "OAS", "CDS", "YTM", "NAV"}
-    tickers = [m.group(0) if hasattr(m, "group") else m for m in TICKER_RE.finditer(raw)]
+
+    blacklist = {"DCF", "WACC", "FCF", "FCFF", "FCFE", "EBITDA", "EPS", "PE", "EV", "IRR", "NPV", "OAS", "CDS", "YTM", "NAV"}
+    tickers = [m.group(0) for m in TICKER_RE.finditer(raw)]
     tickers = [t for t in tickers if t not in blacklist]
-    # de-dup while preserving order
+
     seen = set()
     def uniq(seq):
         out = []
@@ -266,6 +255,7 @@ def extract_identifiers(text: str):
                 seen.add(x)
                 out.append(x)
         return out
+
     return {
         "tickers": uniq(tickers)[:5],
         "isin": uniq(isin)[:3],
@@ -278,7 +268,6 @@ def build_intake_preamble(user_text: str) -> str:
     horizon = detect_horizon(user_text)
     ids = extract_identifiers(user_text)
 
-    # A small “front-matter” that guides the model without forcing it
     return f"""
 [INTAKE (auto-detected, may be wrong)]
 - Asset type guess: {asset_type}
@@ -306,9 +295,9 @@ def ask_openrouter(user_text: str) -> str:
         json={
             "model": OPENROUTER_MODEL,
             "messages": st.session_state.messages,
-            "temperature": 0.4,
+            "temperature": 0.35,
         },
-        timeout=(15, 90),
+        timeout=(15, OPENROUTER_TIMEOUT_READ),
     )
 
     if r.status_code == 401:
@@ -345,10 +334,9 @@ def openrouter_ping():
     return r.status_code, r.text[:600]
 
 # --------------------
-# TTS helpers
+# TTS helpers (with hard timeout)
 # --------------------
 def clean_for_tts(text: str) -> str:
-    # Avoid weird TTS on dense symbols; soften a few common ones
     repl = {
         "—": ", ",
         "–": "-",
@@ -363,8 +351,8 @@ def clean_for_tts(text: str) -> str:
         out = out.replace(k, v)
     return out.strip()
 
-def speak_edge_tts_bytes(text: str) -> bytes:
-    async def _gen():
+def speak_edge_tts_bytes(text: str, timeout_s: int = 20) -> bytes:
+    async def _gen_audio():
         communicate = edge_tts.Communicate(
             text=text,
             voice=EDGE_VOICE,
@@ -376,7 +364,22 @@ def speak_edge_tts_bytes(text: str) -> bytes:
             if chunk["type"] == "audio":
                 audio_bytes += chunk["data"]
         return audio_bytes
-    return asyncio.run(_gen())
+
+    async def _run():
+        return await asyncio.wait_for(_gen_audio(), timeout=timeout_s)
+
+    # asyncio.run can fail if an event loop is already running; guard for that
+    try:
+        return asyncio.run(_run())
+    except RuntimeError:
+        # Fallback for environments with a running event loop
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
 
 # --------------------
 # Vosk STT
@@ -393,11 +396,9 @@ def load_vosk_model():
 def wav_bytes_to_pcm16k_mono(wav_bytes: bytes, target_sr: int = 16000):
     data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=True)
     mono = data.mean(axis=1)
-
     if sr != target_sr:
         mono = resample_poly(mono, target_sr, sr)
         sr = target_sr
-
     pcm16 = (np.clip(mono, -1.0, 1.0) * 32767).astype(np.int16)
     return pcm16.tobytes(), sr
 
@@ -426,6 +427,8 @@ if "last_audio" not in st.session_state:
     st.session_state.last_audio = None
 if "status" not in st.session_state:
     st.session_state.status = ""
+if "debug_last_step" not in st.session_state:
+    st.session_state.debug_last_step = ""
 
 # --------------------
 # UI
@@ -436,24 +439,32 @@ st.caption("Type or 🎙️ speak. I’ll build a fair value range with assumpti
 with st.sidebar:
     st.subheader("Tools")
 
+    ENABLE_TTS = st.toggle("Enable TTS", value=True)
+    SHOW_DEBUG = st.toggle("Show debug info", value=False)
+
     if st.button("🧹 Reset conversation", use_container_width=True):
         st.session_state.messages = [{"role": "system", "content": PERSONA}]
         st.session_state.chat = []
         st.session_state.last_audio = None
         st.session_state.status = ""
+        st.session_state.debug_last_step = ""
         st.rerun()
 
     if st.button("🔊 Test voice", use_container_width=True):
-        try:
-            audio = speak_edge_tts_bytes(
-                "Hi. Tell me the asset, the currency, and whether it's a stock or bond. "
-                "I will estimate a fair value range with scenarios and key risks."
-            )
-            st.session_state.last_audio = audio
-            st.success("Audio generated. If it doesn't autoplay, press play.")
-            st.audio(audio, format="audio/mpeg", autoplay=True)
-        except Exception as e:
-            st.error(f"TTS Error: {e}")
+        if not ENABLE_TTS:
+            st.info("Enable TTS first.")
+        else:
+            try:
+                audio = speak_edge_tts_bytes(
+                    "Hi. Tell me the asset, the currency, and whether it's a stock or bond. "
+                    "I will estimate a fair value range with scenarios and key risks.",
+                    timeout_s=TTS_TIMEOUT_SECONDS,
+                )
+                st.session_state.last_audio = audio
+                st.success("Audio generated. If it doesn't autoplay, press play.")
+                st.audio(audio, format="audio/mpeg", autoplay=True)
+            except Exception as e:
+                st.error(f"TTS Error: {e}")
 
     with st.expander("Diagnostics (optional)"):
         st.write("OpenRouter key loaded:", bool(OPENROUTER_API_KEY))
@@ -461,6 +472,8 @@ with st.sidebar:
         st.write("Edge voice:", EDGE_VOICE)
         st.write("Vosk path:", VOSK_MODEL_PATH)
         st.write("Vosk exists:", os.path.isdir(VOSK_MODEL_PATH))
+        st.write("OpenRouter read timeout:", OPENROUTER_TIMEOUT_READ)
+        st.write("TTS timeout seconds:", TTS_TIMEOUT_SECONDS)
         if st.button("Test OpenRouter"):
             code, body = openrouter_ping()
             st.write("Status:", code)
@@ -475,6 +488,9 @@ for m in st.session_state.chat:
 if st.session_state.status:
     st.info(st.session_state.status)
 
+if SHOW_DEBUG and st.session_state.debug_last_step:
+    st.caption(f"Debug: {st.session_state.debug_last_step}")
+
 if st.session_state.last_audio:
     st.audio(st.session_state.last_audio, format="audio/mpeg", autoplay=True)
 
@@ -488,24 +504,27 @@ mic = mic_recorder(
     stop_prompt="⏹️ Stop",
     just_once=True,
     use_container_width=True,
-    format="wav",  # critical for iOS/Safari + soundfile
+    format="wav",
 )
 
 def handle_user_message(text: str):
     st.session_state.chat.append({"role": "user", "content": text})
     st.session_state.status = "Analyzing…"
     st.session_state.last_audio = None
+    st.session_state.debug_last_step = "start"
 
     try:
         urls = extract_urls(text)
         intake = build_intake_preamble(text)
 
-        with st.spinner("Building valuation framework…"):
-            if urls:
-                st.session_state.status = "Reading link content…"
-                content = fetch_and_extract(urls[0])
+        # 1) Build prompt (+ fetch link text if needed)
+        st.session_state.debug_last_step = "build_prompt"
+        if urls:
+            st.session_state.status = "Reading link content…"
+            st.session_state.debug_last_step = "fetch_link"
+            content = fetch_and_extract(urls[0])
 
-                prompt = f"""
+            prompt = f"""
 {intake}
 
 You are a CFA-style valuation analyst. Use the prior conversation context.
@@ -536,9 +555,8 @@ Rules:
 {content}
 [END LINK TEXT]
 """
-                reply = ask_openrouter(prompt)
-            else:
-                prompt = f"""
+        else:
+            prompt = f"""
 {intake}
 
 You are a CFA-style valuation analyst.
@@ -552,7 +570,7 @@ Perform a fair value assessment (intrinsic value) appropriate for the asset type
 Rules:
 - If the asset/ticker/terms are unclear, infer carefully and ask 1–3 targeted questions ONLY if needed.
 - If the user did not provide current price, still produce an intrinsic value range; note that margin-of-safety vs price requires price.
-- Do not fabricate recent financial data. Use user-provided figures or build a transparent assumption-based model.
+- Do not fabricate recent financial data or specific historical revenues unless provided by the user/link text.
 - Provide ranges and confidence, not certainty.
 
 Output format:
@@ -565,26 +583,43 @@ Output format:
 7) Risks + monitoring checklist
 8) Next data needed (if any)
 """
-                reply = ask_openrouter(prompt)
 
+        # 2) Call OpenRouter
+        st.session_state.status = "Building valuation model…"
+        st.session_state.debug_last_step = "openrouter_call"
+        reply = ask_openrouter(prompt)
+
+        # 3) Append the text reply FIRST (so user will see it even if TTS fails)
+        st.session_state.debug_last_step = "append_reply"
         st.session_state.chat.append({"role": "assistant", "content": reply})
+        st.session_state.status = ""  # clear status so UI can render text
 
-        st.session_state.status = "Generating audio…"
-        SAFE_TTS_CHARS = 900
-        tts_text = clean_for_tts(reply[:SAFE_TTS_CHARS])
-        audio = speak_edge_tts_bytes(tts_text)
-        st.session_state.last_audio = audio
-        st.session_state.status = ""
+        # 4) Optional TTS (guarded + timed)
+        if ENABLE_TTS:
+            try:
+                st.session_state.status = "Generating audio…"
+                st.session_state.debug_last_step = "tts"
+                SAFE_TTS_CHARS = 600  # smaller reduces hang risk
+                tts_text = clean_for_tts(reply[:SAFE_TTS_CHARS])
+                audio = speak_edge_tts_bytes(tts_text, timeout_s=TTS_TIMEOUT_SECONDS)
+                st.session_state.last_audio = audio
+            except Exception as e:
+                # Do NOT block output; show a warning and continue
+                st.warning(f"TTS failed (text reply shown): {e}")
+            finally:
+                st.session_state.status = ""
 
-        st.audio(audio, format="audio/mpeg", autoplay=True)
+        st.session_state.debug_last_step = "done"
 
     except Exception as e:
         st.session_state.status = ""
+        st.session_state.debug_last_step = f"error: {type(e).__name__}"
         st.error(f"Error: {e}")
 
 # If mic recorded something, transcribe and send to chat
 if mic and mic.get("bytes"):
     st.session_state.status = "Transcribing audio…"
+    st.session_state.debug_last_step = "stt"
     try:
         spoken_text = stt_vosk_from_wav_bytes(mic["bytes"])
         st.session_state.status = ""
