@@ -62,7 +62,7 @@ def get_secret(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "deepseek/deepseek-v3.2-speciale")
+OPENROUTER_MODEL = get_secret("OPENROUTER_MODEL", "anthropic/claude-opus-4.6")
 
 EDGE_VOICE = get_secret("EDGE_VOICE", "en-US-JennyNeural")
 EDGE_RATE = get_secret("EDGE_RATE", "-10%")
